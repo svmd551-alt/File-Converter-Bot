@@ -18,7 +18,7 @@ Run:
 """
 import os, asyncio, time, shutil, json
 import aiohttp
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.types import (InlineKeyboardMarkup, InlineKeyboardButton,
                             CallbackQuery, Message)
 
@@ -148,36 +148,115 @@ async def poster(_, m: Message):
         await m.reply_photo(back_url, caption="🖼 Cover / Backdrop")
 
 
-# ───────────────────────── thumbnail ─────────────────────────
+# ───────────────────────── settings (per user) ─────────────────────────
+SETTINGS_FILE = f"{THUMBS}/settings.json"
+DEFAULTS = {"auto": True}
+
+
+def load_settings():
+    try:
+        return json.load(open(SETTINGS_FILE))
+    except Exception:
+        return {}
+
+
+def get_set(uid):
+    return {**DEFAULTS, **load_settings().get(str(uid), {})}
+
+
+def toggle_set(uid, key):
+    data = load_settings()
+    cur = {**DEFAULTS, **data.get(str(uid), {})}
+    cur[key] = not cur[key]
+    data[str(uid)] = cur
+    json.dump(data, open(SETTINGS_FILE, "w"))
+    return cur
+
+
+def settings_kb(uid):
+    st = get_set(uid)
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        f"⚡ Auto cover on video: {'ON ✅' if st['auto'] else 'OFF ❌'}", callback_data="set|auto")]])
+
+
+SETTINGS_TEXT = ("⚙️ **Settings**\n\n"
+                 "**Auto cover ON** – send a video and the cover is added instantly.\n"
+                 "**Auto cover OFF** – send a video and you get the tools menu "
+                 "(rename, convert, qualities, portrait).")
+
+
+@app.on_message(filters.command("settings") & filters.private)
+async def settings_cmd(_, m: Message):
+    await m.reply(SETTINGS_TEXT, reply_markup=settings_kb(m.from_user.id))
+
+
+@app.on_callback_query(filters.regex(r"^set\|"))
+async def settings_cb(_, q: CallbackQuery):
+    toggle_set(q.from_user.id, q.data.split("|")[1])
+    await q.message.edit_text(SETTINGS_TEXT, reply_markup=settings_kb(q.from_user.id))
+    await q.answer("Saved")
+
+
+# ───────────────────────── cover / thumbnail (MAIN FEATURE) ─────────────────────────
 @app.on_message(filters.photo & filters.private)
 async def save_thumb(_, m: Message):
     p = await m.download(file_name=f"{THUMBS}/{m.from_user.id}_raw.jpg")
     # Telegram thumbnails must be JPEG, <=320px, <200KB
-    code, err = await run(["ffmpeg", "-y", "-i", p, "-vf",
-                           "scale='min(320,iw)':-2", "-q:v", "4",
-                           f"{THUMBS}/{m.from_user.id}.jpg"])
+    await run(["ffmpeg", "-y", "-i", p, "-vf", "scale='min(320,iw)':-2", "-q:v", "4",
+               f"{THUMBS}/{m.from_user.id}.jpg"])
     os.remove(p)
-    await m.reply("✅ Thumbnail saved. It will be applied to all your uploads.")
+    await m.reply("✅ **Cover saved!**\nNow send your video and I will add it automatically.")
 
 
-@app.on_message(filters.command("thumb") & filters.private)
+@app.on_message(filters.command(["show_cover", "thumb"]) & filters.private)
 async def show_thumb(_, m):
     t = thumb_path(m.from_user.id)
-    await (m.reply_photo(t, caption="Your thumbnail") if t else m.reply("No thumbnail saved. Send a photo."))
+    await (m.reply_photo(t, caption="🖼 Your current cover") if t
+           else m.reply("No cover saved yet. Send me a photo first."))
 
 
-@app.on_message(filters.command("delthumb") & filters.private)
+@app.on_message(filters.command(["del_cover", "delthumb"]) & filters.private)
 async def del_thumb(_, m):
     t = thumb_path(m.from_user.id)
     if t:
         os.remove(t)
-    await m.reply("🗑 Thumbnail deleted.")
+    await m.reply("🗑 Cover deleted.")
 
 
-# ───────────────────────── file received → menu ─────────────────────────
+async def apply_cover(c, msg: Message):
+    """Re-upload the user's video/file with their cover. No FFmpeg = no quality loss, very fast."""
+    uid = msg.from_user.id
+    media = msg.video or msg.document
+    name = media.file_name or f"video_{msg.id}.mp4"
+    status = await msg.reply("⬇️ Downloading…", quote=True)
+    d = f"{WORK}/{msg.id}_{int(time.time())}"
+    os.makedirs(d, exist_ok=True)
+    try:
+        path = await msg.download(file_name=f"{d}/{name}",
+                                  progress=progress_cb(status, "⬇️ Downloading"))
+        up = progress_cb(status, "⬆️ Uploading")
+        kw = dict(caption=msg.caption or "", caption_entities=msg.caption_entities,
+                  parse_mode=enums.ParseMode.DISABLED, thumb=thumb_path(uid), progress=up)
+        if msg.video:
+            await c.send_video(msg.chat.id, path, duration=media.duration, width=media.width,
+                               height=media.height, supports_streaming=True, **kw)
+        else:
+            await c.send_document(msg.chat.id, path, file_name=name, **kw)
+        await status.delete()
+    except Exception as e:
+        await status.edit_text(f"❌ Failed: `{e}`")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ───────────────────────── file received ─────────────────────────
 @app.on_message((filters.video | filters.document) & filters.private)
-async def got_file(_, m: Message):
-    await m.reply("What do you want to do?", reply_markup=menu(m.id), quote=True)
+async def got_file(c, m: Message):
+    uid = m.from_user.id
+    if get_set(uid)["auto"] and thumb_path(uid):
+        return await apply_cover(c, m)          # main flow: instant cover
+    hint = "" if thumb_path(uid) else "\n\n💡 Send a **photo** first to set your cover."
+    await m.reply("What do you want to do?" + hint, reply_markup=menu(m.id), quote=True)
 
 
 @app.on_message(filters.command("rename") & filters.reply & filters.private)
@@ -187,7 +266,9 @@ async def quick_rename(c, m: Message):
     await do_rename(c, m.reply_to_message, m.text.split(None, 1)[1], m)
 
 
-@app.on_message(filters.text & filters.private & ~filters.command(["poster", "thumb", "delthumb", "rename", "start"]))
+@app.on_message(filters.text & filters.private &
+                ~filters.command(["poster", "thumb", "delthumb", "show_cover", "del_cover",
+                                  "settings", "rename", "start"]))
 async def text_in(c, m: Message):
     uid = m.from_user.id
     if uid in PENDING_RENAME:
@@ -198,11 +279,18 @@ async def text_in(c, m: Message):
 @app.on_message(filters.command("start"))
 async def start(_, m):
     await m.reply(
-        "🎬 **Media Bot**\n\n"
-        "• `/poster <movie>` – IMDb/TMDB poster + cover\n"
-        "• Send a **photo** – saved as your thumbnail\n"
-        "• Send a **video/file** – rename, MKV↔MP4, 360/480/720p, portrait 9:16\n"
-        "• `/thumb`, `/delthumb` – manage thumbnail")
+        "Welcome to 🎬 **Fast Thumbnail Bot**\n\n"
+        "- Add a custom **cover/thumbnail** to your videos instantly!\n\n"
+        "**How it works:** 🤔\n"
+        "1. Send your **photo** (cover/thumbnail).\n"
+        "2. Send your **video**, and the bot will add the cover automatically.\n\n"
+        "✱ **Commands:**\n"
+        "/settings - Customize bot settings\n"
+        "/show_cover - View your current cover\n"
+        "/del_cover - Delete your saved cover\n"
+        "/poster `<movie>` - IMDb / TMDB poster & cover\n\n"
+        "Extra tools (turn Auto cover OFF in /settings): rename, MKV↔MP4, "
+        "360/480/720p, portrait 9:16.")
 
 
 # ───────────────────────── actions ─────────────────────────
@@ -273,7 +361,7 @@ def ffmpeg_multi(src, outputs):
     return cmd
 
 
-@app.on_callback_query()
+@app.on_callback_query(filters.regex(r"^(rn|mp4|mkv|q360|q480|q720|qall|port)\|"))
 async def cb(c: Client, q: CallbackQuery):
     action, mid = q.data.split("|")
     msg = await c.get_messages(q.message.chat.id, int(mid))
