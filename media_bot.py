@@ -2,7 +2,6 @@
 Telegram Media Bot (Pyrogram + FFmpeg)
 --------------------------------------
 Features
-  /poster <movie name>   -> TMDB + IMDb (OMDb) poster/cover/backdrop
   Send a video/file      -> menu: Rename | MKV<->MP4 | 360/480/720p | Portrait 9:16 | Set thumbnail
   Send a photo           -> saved as your custom thumbnail (used on every upload)
   /thumb  /delthumb      -> view / delete saved thumbnail
@@ -12,12 +11,11 @@ Install:
   pip install -U pyrogram tgcrypto aiohttp aiofiles
   apt install ffmpeg
 Env vars:
-  API_ID, API_HASH, BOT_TOKEN, TMDB_KEY, OMDB_KEY (free keys from themoviedb.org / omdbapi.com)
+  API_ID, API_HASH, BOT_TOKEN
 Run:
   python media_bot.py
 """
 import os, asyncio, time, shutil, json
-import aiohttp
 from pyrogram import Client, filters, enums
 from pyrogram.types import (InlineKeyboardMarkup, InlineKeyboardButton,
                             CallbackQuery, Message)
@@ -25,8 +23,6 @@ from pyrogram.types import (InlineKeyboardMarkup, InlineKeyboardButton,
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-TMDB_KEY = os.environ.get("TMDB_KEY", "")
-OMDB_KEY = os.environ.get("OMDB_KEY", "")
 
 WORK = "work"
 THUMBS = "thumbs"
@@ -38,7 +34,7 @@ app = Client("media_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
 
 # ── speed settings (override with env vars on Render) ──
 CPU = os.cpu_count() or 2
-PRESET = os.environ.get("X264_PRESET", "superfast")   # ultrafast = fastest, bigger file
+PRESET = os.environ.get("X264_PRESET", "ultrafast")   # ultrafast = fastest, bigger file
 CRF = os.environ.get("X264_CRF", "26")                # higher = faster/smaller, lower quality
 PORTRAIT_W, PORTRAIT_H = (int(x) for x in os.environ.get("PORTRAIT_RES", "720x1280").split("x"))
 # 1 heavy ffmpeg job at a time gets ALL cores (faster than 2 jobs fighting for CPU)
@@ -75,18 +71,94 @@ async def probe(path):
     return int(float(d.get("format", {}).get("duration", 0))), v.get("width", 0), v.get("height", 0)
 
 
+def human(n):
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024 or u == "GB":
+            return f"{n:.1f} {u}" if u != "B" else f"{int(n)} B"
+        n /= 1024
+
+
+def fmt_time(sec):
+    sec = int(max(sec, 0))
+    h, r = divmod(sec, 3600)
+    m, s_ = divmod(r, 60)
+    return f"{h}:{m:02d}:{s_:02d}" if h else f"{m:02d}:{s_:02d}"
+
+
+def bar(pct, n=12):
+    f = int(n * pct / 100)
+    return "█" * f + "░" * (n - f)
+
+
+def render(label, pct, extra=""):
+    return f"{label}\n`[{bar(pct)}]` **{pct:.1f}%**\n{extra}"
+
+
 def progress_cb(msg, label):
-    last = {"t": 0}
+    """Download / upload progress: bar, size, speed, ETA."""
+    st = {"t": 0, "t0": time.time()}
 
     async def cb(cur, total):
-        if time.time() - last["t"] < 4:
+        now = time.time()
+        if now - st["t"] < 3 and cur < total:
             return
-        last["t"] = time.time()
+        st["t"] = now
+        total = total or cur or 1
+        pct = cur * 100 / total
+        el = max(now - st["t0"], 0.001)
+        speed = cur / el
+        eta = (total - cur) / speed if speed else 0
         try:
-            await msg.edit_text(f"{label} {cur * 100 / total:.0f}%")
+            await msg.edit_text(render(label, pct,
+                f"📦 {human(cur)} / {human(total)}\n🚀 {human(speed)}/s\n⏳ ETA {fmt_time(eta)}"))
         except Exception:
             pass
     return cb
+
+
+async def run_ffmpeg(cmd, duration, status, label):
+    """Run ffmpeg and live-update the status message (bar, speed, ETA)."""
+    cmd = cmd[:1] + ["-nostdin", "-progress", "pipe:1", "-nostats"] + cmd[1:]
+    p = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    err_buf = bytearray()
+
+    async def read_err():
+        while True:
+            chunk = await p.stderr.read(4096)
+            if not chunk:
+                break
+            err_buf.extend(chunk)
+            del err_buf[:-4000]
+
+    err_task = asyncio.create_task(read_err())
+    t0, last = time.time(), 0
+    while True:
+        line = await p.stdout.readline()
+        if not line:
+            break
+        line = line.decode(errors="ignore").strip()
+        if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+            try:
+                done = int(line.split("=")[1]) / 1_000_000
+            except ValueError:
+                continue
+            now = time.time()
+            if duration and now - last >= 3:
+                last = now
+                pct = min(done * 100 / duration, 99.9)
+                el = max(now - t0, 0.001)
+                spd = done / el
+                eta = (duration - done) / spd if spd else 0
+                try:
+                    await status.edit_text(render(label, pct,
+                        f"🎞 {fmt_time(done)} / {fmt_time(duration)}\n"
+                        f"🚀 {spd:.1f}x speed\n⏳ ETA {fmt_time(eta)}"))
+                except Exception:
+                    pass
+    await p.wait()
+    await err_task
+    return p.returncode, err_buf.decode(errors="ignore")
 
 
 def menu(mid):
@@ -100,52 +172,6 @@ def menu(mid):
         [InlineKeyboardButton("🎞 All 3 qualities", callback_data=f"qall|{mid}")],
         [InlineKeyboardButton("📱 Portrait 9:16", callback_data=f"port|{mid}")],
     ])
-
-
-# ───────────────────────── poster (TMDB + IMDb/OMDb) ─────────────────────────
-async def tmdb_search(session, name):
-    url = "https://api.themoviedb.org/3/search/multi"
-    async with session.get(url, params={"api_key": TMDB_KEY, "query": name}) as r:
-        data = await r.json()
-    res = [x for x in data.get("results", []) if x.get("media_type") in ("movie", "tv")]
-    return res[0] if res else None
-
-
-async def omdb_lookup(session, name):
-    if not OMDB_KEY:
-        return None
-    async with session.get("http://www.omdbapi.com/",
-                           params={"apikey": OMDB_KEY, "t": name}) as r:
-        d = await r.json()
-    return d if d.get("Response") == "True" else None
-
-
-@app.on_message(filters.command("poster"))
-async def poster(_, m: Message):
-    if len(m.command) < 2:
-        return await m.reply("Usage: `/poster Inception 2010`")
-    name = m.text.split(None, 1)[1]
-    async with aiohttp.ClientSession() as s:
-        tm, om = await asyncio.gather(tmdb_search(s, name), omdb_lookup(s, name))
-    if not tm and not om:
-        return await m.reply("❌ Not found.")
-
-    title = (tm or {}).get("title") or (tm or {}).get("name") or om.get("Title")
-    year = ((tm or {}).get("release_date") or (tm or {}).get("first_air_date") or om.get("Year", ""))[:4]
-    rating = om.get("imdbRating") if om else None
-    caption = f"🎬 **{title}** ({year})"
-    if rating:
-        caption += f"\n⭐ IMDb: {rating}"
-    if tm and tm.get("overview"):
-        caption += f"\n\n{tm['overview'][:600]}"
-
-    poster_url = f"https://image.tmdb.org/t/p/original{tm['poster_path']}" if tm and tm.get("poster_path") else (om or {}).get("Poster")
-    back_url = f"https://image.tmdb.org/t/p/original{tm['backdrop_path']}" if tm and tm.get("backdrop_path") else None
-
-    if poster_url and poster_url != "N/A":
-        await m.reply_photo(poster_url, caption=caption)
-    if back_url:
-        await m.reply_photo(back_url, caption="🖼 Cover / Backdrop")
 
 
 # ───────────────────────── settings (per user) ─────────────────────────
@@ -228,7 +254,7 @@ async def apply_cover(c, msg: Message):
     uid = msg.from_user.id
     media = msg.video or msg.document
     name = media.file_name or f"video_{msg.id}.mp4"
-    status = await msg.reply("⬇️ Downloading…", quote=True)
+    status = await msg.reply("⬇️ Starting download…", quote=True)
     d = f"{WORK}/{msg.id}_{int(time.time())}"
     os.makedirs(d, exist_ok=True)
     try:
@@ -267,7 +293,7 @@ async def quick_rename(c, m: Message):
 
 
 @app.on_message(filters.text & filters.private &
-                ~filters.command(["poster", "thumb", "delthumb", "show_cover", "del_cover",
+                ~filters.command(["thumb", "delthumb", "show_cover", "del_cover",
                                   "settings", "rename", "start"]))
 async def text_in(c, m: Message):
     uid = m.from_user.id
@@ -288,7 +314,7 @@ async def start(_, m):
         "/settings - Customize bot settings\n"
         "/show_cover - View your current cover\n"
         "/del_cover - Delete your saved cover\n"
-        "/poster `<movie>` - IMDb / TMDB poster & cover\n\n"
+        "\n"
         "Extra tools (turn Auto cover OFF in /settings): rename, MKV↔MP4, "
         "360/480/720p, portrait 9:16.")
 
@@ -298,7 +324,7 @@ async def send_back(c, chat_id, path, uid, status, caption, as_video=True):
     dur, w, h = (0, 0, 0)
     if as_video:
         dur, w, h = await probe(path)
-    cb = progress_cb(status, "⬆️ Uploading")
+    cb = progress_cb(status, f"⬆️ Uploading `{os.path.basename(path)[:40]}`")
     t = thumb_path(uid)
     if as_video and path.lower().endswith((".mp4", ".mkv")):
         await c.send_video(chat_id, path, caption=caption, duration=dur, width=w, height=h,
@@ -314,7 +340,7 @@ async def do_rename(c, orig: Message, new_name, reply_to):
     ext = os.path.splitext(media.file_name or "")[1] or ".mkv"
     if not os.path.splitext(new_name)[1]:
         new_name += ext
-    status = await reply_to.reply("⬇️ Downloading…")
+    status = await reply_to.reply("⬇️ Starting download…")
     d = f"{WORK}/{orig.id}_{int(time.time())}"
     os.makedirs(d, exist_ok=True)
     src = await orig.download(file_name=f"{d}/src", progress=progress_cb(status, "⬇️ Downloading"))
@@ -375,7 +401,7 @@ async def cb(c: Client, q: CallbackQuery):
         return
 
     modes = ["q360", "q480", "q720"] if action == "qall" else [action]
-    status = await q.message.edit_text("⬇️ Downloading…")
+    status = await q.message.edit_text("⬇️ Starting download…")
     d = f"{WORK}/{mid}_{int(time.time())}"
     os.makedirs(d, exist_ok=True)
     try:
@@ -387,9 +413,11 @@ async def cb(c: Client, q: CallbackQuery):
             _, _, src_h = await probe(src)
             targets = [h for h in (360, 480, 720) if h <= max(src_h, 360)]   # never upscale
             paths = [(h, f"{d}/{base}_{h}p.mp4") for h in targets]
-            await status.edit_text(f"⚙️ Converting {', '.join(str(h) + 'p' for h in targets)} (single pass)…")
+            dur = (await probe(src))[0]
+            await status.edit_text(f"⏳ Waiting for a free converter slot…")
             async with JOB_SLOTS:
-                code, err = await run(ffmpeg_multi(src, paths))
+                code, err = await run_ffmpeg(ffmpeg_multi(src, paths), dur, status,
+                                             f"⚙️ Converting {', '.join(str(h) + 'p' for h in targets)}")
             if code != 0:
                 return await status.edit_text(f"❌ FFmpeg failed:\n`{err[-500:]}`")
             outs = [p for _, p in paths]
@@ -398,18 +426,22 @@ async def cb(c: Client, q: CallbackQuery):
             ext = "mkv" if mode == "mkv" else "mp4"
             suffix = {"port": "portrait"}.get(mode, mode)
             dst = f"{d}/{base}_{suffix}.{ext}"
-            await status.edit_text(f"⚙️ Converting ({mode})…")
+            dur = (await probe(src))[0]
+            await status.edit_text("⏳ Waiting for a free converter slot…")
             async with JOB_SLOTS:
-                code, err = await run(ffmpeg_cmd(src, dst, mode))
+                code, err = await run_ffmpeg(ffmpeg_cmd(src, dst, mode), dur, status,
+                                             f"⚙️ Converting ({mode})")
             if code != 0 or not os.path.exists(dst):
                 return await status.edit_text(f"❌ FFmpeg failed:\n`{err[-500:]}`")
             outs = [dst]
 
         os.remove(src)
         # upload all results in parallel
-        await asyncio.gather(*(send_back(c, q.message.chat.id, p, q.from_user.id, status,
-                                         f"`{os.path.basename(p)}`") for p in outs))
-        await status.delete()
+        sts = [status] + [await status.reply("⬆️ Preparing upload…") for _ in outs[1:]]
+        await asyncio.gather(*(send_back(c, q.message.chat.id, p, q.from_user.id, st,
+                                         f"`{os.path.basename(p)}`") for p, st in zip(outs, sts)))
+        for st in sts:
+            await st.delete()
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
