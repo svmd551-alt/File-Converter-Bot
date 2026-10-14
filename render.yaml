@@ -17,3 +17,10 @@ services:
         sync: false
       - key: OMDB_KEY
         sync: false
+      # optional speed tuning
+      - key: X264_PRESET
+        value: superfast        # ultrafast = fastest
+      - key: X264_CRF
+        value: "26"
+      - key: PORTRAIT_RES
+        value: 720x1280         # use 1080x1920 for full HD (slower)
