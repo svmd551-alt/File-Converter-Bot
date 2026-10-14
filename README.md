@@ -22,3 +22,8 @@ media_bot.py · requirements.txt · Dockerfile · render.yaml · .env.example
   Add a persistent Disk mounted at /app/thumbs (paid plans) to keep them.
 - Video conversion is CPU heavy; use at least the Starter plan for 480p/720p/portrait jobs.
 - Free plan has only 512 MB RAM / limited disk, so large files (>500 MB) may fail.
+
+## Speed tuning (optional env vars)
+- X264_PRESET: ultrafast (fastest) | superfast (default) | veryfast | faster
+- X264_CRF: 24 (better quality) ... 28 (faster, smaller). Default 26.
+- PORTRAIT_RES: 720x1280 (default, fast) or 1080x1920.
