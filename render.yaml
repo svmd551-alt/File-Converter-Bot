@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: telegram-media-bot
+    runtime: docker
+    plan: starter          # free plan works for testing but sleeps; starter+ recommended for ffmpeg
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: TMDB_KEY
+        sync: false
+      - key: OMDB_KEY
+        sync: false

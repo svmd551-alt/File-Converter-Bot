@@ -1,0 +1,7 @@
+work/
+thumbs/
+*.session
+*.session-journal
+.env
+__pycache__/
+.git/
