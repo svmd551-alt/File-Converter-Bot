@@ -345,8 +345,11 @@ async def health_server():
 async def main():
     from pyrogram import idle
     await health_server()
-    print("Bot started")
-    await idle()   # app.run() handles start()/stop() around this
+    await app.start()          # app.run(coroutine) does NOT start the client by itself
+    me = await app.get_me()
+    print(f"Bot started as @{me.username}", flush=True)
+    await idle()
+    await app.stop()
 
 
 if __name__ == "__main__":
