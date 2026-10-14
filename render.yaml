@@ -13,13 +13,9 @@ services:
         sync: false
       - key: BOT_TOKEN
         sync: false
-      - key: TMDB_KEY
-        sync: false
-      - key: OMDB_KEY
-        sync: false
       # optional speed tuning
       - key: X264_PRESET
-        value: superfast        # ultrafast = fastest
+        value: ultrafast        # fastest (default)
       - key: X264_CRF
         value: "26"
       - key: PORTRAIT_RES
