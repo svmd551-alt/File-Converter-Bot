@@ -34,10 +34,18 @@ os.makedirs(WORK, exist_ok=True)
 os.makedirs(THUMBS, exist_ok=True)
 
 app = Client("media_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
-             workers=16, max_concurrent_transmissions=4)
+             workers=32, max_concurrent_transmissions=8)
 
-# one ffmpeg job at a time per user, max 2 jobs globally (keeps the bot fast)
-JOB_SLOTS = asyncio.Semaphore(2)
+# ── speed settings (override with env vars on Render) ──
+CPU = os.cpu_count() or 2
+PRESET = os.environ.get("X264_PRESET", "superfast")   # ultrafast = fastest, bigger file
+CRF = os.environ.get("X264_CRF", "26")                # higher = faster/smaller, lower quality
+PORTRAIT_W, PORTRAIT_H = (int(x) for x in os.environ.get("PORTRAIT_RES", "720x1280").split("x"))
+# 1 heavy ffmpeg job at a time gets ALL cores (faster than 2 jobs fighting for CPU)
+JOB_SLOTS = asyncio.Semaphore(1 if CPU <= 4 else 2)
+VENC = ["-c:v", "libx264", "-preset", PRESET, "-crf", CRF, "-threads", "0",
+        "-pix_fmt", "yuv420p", "-sn"]
+AENC = ["-c:a", "aac", "-b:a", "96k", "-ac", "2"]
 PENDING_RENAME = {}   # user_id -> message_id of file awaiting new name
 
 QUALITIES = {"360": 360, "480": 480, "720": 720}
@@ -232,26 +240,37 @@ async def do_rename(c, orig: Message, new_name, reply_to):
 
 
 def ffmpeg_cmd(src, dst, mode):
-    base = ["ffmpeg", "-y", "-i", src, "-map", "0:v:0", "-map", "0:a?", "-map", "0:s?"]
-    if mode in ("mp4", "mkv"):
-        # remux (no re-encode) = very fast. MP4 can't hold most subs, so drop them.
-        if mode == "mp4":
-            return ["ffmpeg", "-y", "-i", src, "-map", "0:v:0", "-map", "0:a?",
-                    "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", dst]
+    if mode == "mp4":      # remux video (instant), only audio -> aac for compatibility
+        return ["ffmpeg", "-y", "-i", src, "-map", "0:v:0", "-map", "0:a?", "-c:v", "copy",
+                *AENC, "-movflags", "+faststart", dst]
+    if mode == "mkv":      # pure stream copy = instant
         return ["ffmpeg", "-y", "-i", src, "-map", "0", "-c", "copy", dst]
     if mode.startswith("q"):
         h = QUALITIES[mode[1:]]
         return ["ffmpeg", "-y", "-i", src, "-map", "0:v:0", "-map", "0:a?",
-                "-vf", f"scale=-2:{h}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
-                "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", dst]
+                "-vf", f"scale=-2:{h}:flags=fast_bilinear", *VENC, *AENC,
+                "-movflags", "+faststart", dst]
     if mode == "port":
-        # 1080x1920 portrait, blurred background + centered original (no cropping)
-        vf = ("split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,"
-              "crop=1080:1920,boxblur=25:5[bg];"
-              "[b]scale=1080:-2:force_original_aspect_ratio=decrease[fg];"
-              "[bg][fg]overlay=(W-w)/2:(H-h)/2")
-        return ["ffmpeg", "-y", "-i", src, "-vf", vf, "-c:v", "libx264", "-preset", "veryfast",
-                "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", dst]
+        W, H = PORTRAIT_W, PORTRAIT_H
+        # background is blurred at TINY size then scaled up = much faster than blurring full-res
+        vf = (f"split[a][b];[a]scale={W // 10}:{H // 10}:force_original_aspect_ratio=increase,"
+              f"crop={W // 10}:{H // 10},boxblur=3:1,scale={W}:{H}:flags=fast_bilinear[bg];"
+              f"[b]scale={W}:-2:flags=fast_bilinear[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2")
+        return ["ffmpeg", "-y", "-i", src, "-map", "0:a?", "-filter_complex", vf,
+                *VENC, *AENC, "-movflags", "+faststart", dst]
+
+
+def ffmpeg_multi(src, outputs):
+    """ONE pass: decode once, encode several qualities at the same time.
+    outputs = [(height, dst_path), ...]"""
+    n = len(outputs)
+    labels = "".join(f"[v{i}]" for i in range(n))
+    fc = f"[0:v:0]split={n}{labels};" + ";".join(
+        f"[v{i}]scale=-2:{h}:flags=fast_bilinear[o{i}]" for i, (h, _) in enumerate(outputs))
+    cmd = ["ffmpeg", "-y", "-i", src, "-filter_complex", fc]
+    for i, (_, dst) in enumerate(outputs):
+        cmd += ["-map", f"[o{i}]", "-map", "0:a?", *VENC, *AENC, "-movflags", "+faststart", dst]
+    return cmd
 
 
 @app.on_callback_query()
@@ -274,7 +293,20 @@ async def cb(c: Client, q: CallbackQuery):
     try:
         src = await msg.download(file_name=f"{d}/src", progress=progress_cb(status, "⬇️ Downloading"))
         base = os.path.splitext(media.file_name or "video")[0]
-        for mode in modes:
+        outs = []   # list of dst paths to upload
+
+        if action == "qall":
+            _, _, src_h = await probe(src)
+            targets = [h for h in (360, 480, 720) if h <= max(src_h, 360)]   # never upscale
+            paths = [(h, f"{d}/{base}_{h}p.mp4") for h in targets]
+            await status.edit_text(f"⚙️ Converting {', '.join(str(h) + 'p' for h in targets)} (single pass)…")
+            async with JOB_SLOTS:
+                code, err = await run(ffmpeg_multi(src, paths))
+            if code != 0:
+                return await status.edit_text(f"❌ FFmpeg failed:\n`{err[-500:]}`")
+            outs = [p for _, p in paths]
+        else:
+            mode = modes[0]
             ext = "mkv" if mode == "mkv" else "mp4"
             suffix = {"port": "portrait"}.get(mode, mode)
             dst = f"{d}/{base}_{suffix}.{ext}"
@@ -282,10 +314,13 @@ async def cb(c: Client, q: CallbackQuery):
             async with JOB_SLOTS:
                 code, err = await run(ffmpeg_cmd(src, dst, mode))
             if code != 0 or not os.path.exists(dst):
-                await status.edit_text(f"❌ FFmpeg failed:\n`{err[-500:]}`")
-                return
-            await send_back(c, q.message.chat.id, dst, q.from_user.id, status, f"`{os.path.basename(dst)}`")
-            os.remove(dst)
+                return await status.edit_text(f"❌ FFmpeg failed:\n`{err[-500:]}`")
+            outs = [dst]
+
+        os.remove(src)
+        # upload all results in parallel
+        await asyncio.gather(*(send_back(c, q.message.chat.id, p, q.from_user.id, status,
+                                         f"`{os.path.basename(p)}`") for p in outs))
         await status.delete()
     finally:
         shutil.rmtree(d, ignore_errors=True)
