@@ -46,3 +46,27 @@ A bot itself can only do 2 GB. For bigger files a Premium *user* account does th
 4. Forward the big video to your **Saved Messages** -> cover is added automatically.
    (Or upload it to Saved Messages and reply to it with `/cover`.)
 Note: it uses your own account, so keep the session string secret.
+
+## Why is converting (360/480/720p) slow?
+Converting really re-encodes the video, so it needs CPU. Speed (`0.2x` = 5 hours of video takes 25 hours) depends only on the server's CPU, not on Telegram.
+- Startup log shows `[cpu] usable CPU cores: ...` (the real quota of your plan). Around 0.5 cores = slow; 2-4+ cores = much faster.
+- Convert ONE quality instead of "All 3" (less work). Every job has a 🛑 Cancel button.
+- Cover, rename, To MP4 and To MKV do not re-encode, so they are fast on any plan.
+
+## Cover on ANY video size (instant)
+For normal videos the bot uses Telegram's *video cover* feature: it resends the SAME video (by `file_id`) with your poster as cover.
+Nothing is downloaded or uploaded, so a 5 GB video takes about a second and there is no 2 GB / 4 GB limit.
+- Send your poster photo to the bot again once, so it keeps an HD copy (older saves only have a small 320px copy).
+- Needs a reasonably recent Telegram app to display the cover.
+- Videos sent as a *file/document* (not as video) can't use this; they still use the re-upload method (2 GB limit, 4 GB with the Premium helper).
+- If it fails, the bot shows the exact Telegram error text.
+
+## Rename big files
+Rename = download + upload again, so a bot can only rename files up to 2 GB. For 2-4 GB: put the file in your **Saved Messages** and reply to it with `/rename New Name.mkv` (needs the Premium helper). Any failure is now shown in the chat instead of freezing on "Downloading 100%".
+
+## Direct links
+Send a **direct file link** (a normal `https://.../file.mkv` URL that starts the download by itself) and the bot downloads it, adds your cover and sends it back.
+- Fast: several connections at once (`LINK_CONNS`, default 6), resumes by itself after a network drop, has a 🛑 Cancel button.
+- Safe: private/local addresses are refused (also on redirects). Set `LINK_ALLOWED_USERS=123,456` to let only those Telegram ids use links.
+- Limit: 2000 MB for the bot. 2-4 GB: paste the link in your **Saved Messages** (Premium helper).
+- Web pages, share pages (TeraBox and similar) are not direct files and are refused with a message.
