@@ -2,7 +2,7 @@ services:
   - type: web
     name: telegram-media-bot
     runtime: docker
-    plan: starter          # free plan works for testing but sleeps; starter+ recommended for ffmpeg
+    plan: starter          # CONVERT speed = CPU of this plan. Starter has only ~0.5 CPU (very slow for 360/480/720p). Cover/rename/MKV<->MP4 do NOT need CPU
     dockerfilePath: ./Dockerfile
     healthCheckPath: /
     autoDeploy: true
@@ -32,3 +32,5 @@ services:
         value: "8"
       - key: UPLOAD_WORKERS     # parts in flight per connection
         value: "2"
+      - key: FFMPEG_THREADS     # optional: override auto-detected ffmpeg threads
+        sync: false
