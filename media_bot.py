@@ -2,10 +2,12 @@
 Telegram Media Bot (Pyrogram + FFmpeg)
 --------------------------------------
 Features
-  Send a video/file      -> menu: Rename | MKV<->MP4 | 360/480/720p | Portrait 9:16 | Set thumbnail
-  Send a photo           -> saved as your custom thumbnail (used on every upload)
-  /thumb  /delthumb      -> view / delete saved thumbnail
-  /rename <new name>     -> reply to a file with this to rename instantly
+  Send a photo           -> saved as your cover/thumbnail
+  Send a video           -> cover added instantly (Auto cover ON, any size)
+                            or tools menu (Auto cover OFF): Rename | MKV<->MP4 | 360/480/720p | Portrait 9:16
+  /settings              -> Auto cover ON/OFF
+  /show_cover /del_cover -> view / delete saved cover
+  /rename <new name>     -> reply to a file with this to rename it
 
 Install:
   pip install -U pyrogram tgcrypto aiohttp aiofiles
@@ -16,10 +18,11 @@ Env vars:
 Run:
   python media_bot.py
 """
-import os, re, math, asyncio, time, shutil, json, uuid, urllib.request, urllib.error
+import os, re, math, asyncio, time, shutil, json, uuid, threading, urllib.request, urllib.error, urllib.parse
 from pyrogram import Client, filters, enums
 from pyrogram.errors import FloodWait
 from pyrogram.handlers import MessageHandler
+import linkdl
 
 try:                                   # faster event loop = faster transfers
     import uvloop
@@ -33,6 +36,8 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 BOT_API_URL = os.environ.get("BOT_API_URL", "https://api.telegram.org").rstrip("/")
+# optional: only these Telegram user ids may use link downloads (comma separated). Empty = everyone.
+LINK_USERS = {int(x) for x in re.split(r"[,\s]+", os.environ.get("LINK_ALLOWED_USERS", "")) if x.strip().isdigit()}
 SESSION_STRING = os.environ.get("SESSION_STRING", "").strip()   # Premium user account (for 4 GB)
 
 WORK = os.path.abspath("work")
@@ -133,9 +138,16 @@ async def probe(path):
         "-show_streams", "-show_format", path,
         stdout=asyncio.subprocess.PIPE)
     out, _ = await p.communicate()
-    d = json.loads(out or "{}")
-    v = next((s for s in d.get("streams", []) if s["codec_type"] == "video"), {})
-    return int(float(d.get("format", {}).get("duration", 0))), v.get("width", 0), v.get("height", 0)
+    try:
+        d = json.loads(out or "{}")
+    except ValueError:
+        d = {}
+    v = next((s for s in d.get("streams", []) if s.get("codec_type") == "video"), {})
+    try:
+        dur = int(float(d.get("format", {}).get("duration", 0) or 0))
+    except (TypeError, ValueError):
+        dur = 0
+    return dur, v.get("width", 0), v.get("height", 0)
 
 
 def human(n):
@@ -217,7 +229,10 @@ def safe_name(name, fallback):
     """Strip path characters and keep the name short enough for any filesystem."""
     name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name or "").strip(" .") or fallback
     base, ext = os.path.splitext(name)
-    return base[:120] + ext[:10]
+    ext = ext[:10]
+    while len(base.encode()) > 200 - len(ext.encode()):     # filesystem limit is 255 BYTES
+        base = base[:-1]
+    return base + ext
 
 
 def enough_disk(size):
@@ -284,6 +299,11 @@ def _bot_api_post(method, fields, files, timeout=180):
             return {"ok": False, "description": f"HTTP {e.code}"}
 
 
+def redact(text):
+    """Never show the bot token in chat/logs."""
+    return str(text).replace(BOT_TOKEN, "***")
+
+
 async def add_cover_by_file_id(msg, uid):
     """Telegram 'video cover': resend the SAME video (by file_id) with a new cover.
     Nothing is downloaded or uploaded, so it is instant and works for ANY video size."""
@@ -300,11 +320,14 @@ async def add_cover_by_file_id(msg, uid):
             fields["caption"] = html if use_html else plain
             if use_html:
                 fields["parse_mode"] = "HTML"
-        data = await asyncio.to_thread(_bot_api_post, "sendVideo", fields,
-                                       {"cover_file": ("cover.jpg", cover, "image/jpeg")})
+        try:
+            data = await asyncio.to_thread(_bot_api_post, "sendVideo", fields,
+                                           {"cover_file": ("cover.jpg", cover, "image/jpeg")})
+        except Exception as e:                       # network error / timeout: report, never crash silently
+            return False, redact(f"{type(e).__name__}: {e}")
         if data.get("ok"):
             return True, ""
-        err = data.get("description", "unknown error")
+        err = redact(data.get("description", "unknown error"))
         if "parse entities" not in err.lower():
             break
     return False, err
@@ -397,7 +420,8 @@ DEFAULTS = {"auto": True}
 
 def load_settings():
     try:
-        return json.load(open(SETTINGS_FILE))
+        with open(SETTINGS_FILE) as f:
+            return json.load(f)
     except Exception:
         return {}
 
@@ -411,7 +435,8 @@ def toggle_set(uid, key):
     cur = {**DEFAULTS, **data.get(str(uid), {})}
     cur[key] = not cur[key]
     data[str(uid)] = cur
-    json.dump(data, open(SETTINGS_FILE, "w"))
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(data, f)
     return cur
 
 
@@ -443,11 +468,14 @@ async def settings_cb(_, q: CallbackQuery):
 async def store_thumb(m: Message):
     """Save a photo (or an image sent as file) as the user's cover."""
     uid = m.from_user.id
-    raw = await m.download(file_name=f"{THUMBS}/{uid}_raw")
+    raw, ok = None, False
     try:
-        ok = await make_thumb(raw, f"{THUMBS}/{uid}.jpg")
+        raw = await m.download(file_name=f"{THUMBS}/{uid}_raw")
+        ok = bool(raw) and await make_thumb(raw, f"{THUMBS}/{uid}.jpg")
         if ok:
             await make_cover(raw, f"{THUMBS}/{uid}_cover.jpg")      # HD copy for the instant-cover method
+    except Exception as e:
+        print(f"[cover] saving photo failed: {e!r}", flush=True)
     finally:
         if raw and os.path.exists(raw):
             os.remove(raw)
@@ -462,7 +490,7 @@ async def save_thumb(_, m: Message):
 
 @app.on_message(filters.command(["show_cover", "thumb"]) & filters.private)
 async def show_thumb(_, m):
-    t = thumb_path(m.from_user.id)
+    t = cover_path(m.from_user.id)
     await (m.reply_photo(t, caption="🖼 Your current cover") if t
            else m.reply("No cover saved yet. Send me a photo first."))
 
@@ -560,6 +588,111 @@ async def quick_rename(c, m: Message):
     await do_rename(c, m.reply_to_message, m.text.split(None, 1)[1], m)
 
 
+# ───────────────────────── direct links ─────────────────────────
+URL_FIND = re.compile(r"https?://[^\s<>\"']+", re.I)
+TERABOX_HOST = re.compile(r"(tera|nephobox|4funbox|mirrobox|momerybox)", re.I)
+
+
+def find_urls(text):
+    out = []
+    for u in URL_FIND.findall(text or ""):
+        u = u.rstrip(".,;:!?]}'\"")
+        if u not in out:
+            out.append(u)
+    return out[:3]
+
+
+class DlJob:
+    """Lets the Cancel button stop a link download (same interface as an ffmpeg process)."""
+    def __init__(self):
+        self.event = threading.Event()
+        self.returncode = None
+
+    def kill(self):
+        self.event.set()
+
+
+async def download_link(c, m: Message, url, limit, uid):
+    """Download a DIRECT file link, then send it back with the user's cover."""
+    status = await m.reply("🔎 Checking link…", quote=True)
+    try:
+        info = await asyncio.to_thread(linkdl.probe, url)
+    except linkdl.LinkError as e:
+        return await status.edit_text(f"❌ {e}")
+    except Exception as e:
+        return await status.edit_text(f"❌ Could not check the link: `{redact(e)}`")
+    size = info["size"] or 0
+    name = safe_name(info["name"], f"file_{m.id}")
+    if size > limit:
+        if c is app and user:
+            tip = "\n\n💡 Paste the link in your **Saved Messages** — the Premium helper handles up to ~4 GB."
+        elif c is app:
+            tip = "\n\n💡 For files up to ~4 GB add the Premium helper (`SESSION_STRING`, see README)."
+        else:
+            tip = ""
+        return await status.edit_text(f"❌ This file is {size // 1024 // 1024} MB. The limit here is "
+                                      f"{limit // 1024 // 1024} MB.{tip}")
+    d = f"{WORK}/link_{m.id}_{int(time.time())}"
+    os.makedirs(d, exist_ok=True)
+    job, key = DlJob(), status.id
+    kb = (InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel", callback_data=f"cx|{key}")]])
+          if c is app else None)                      # user accounts cannot send inline buttons
+    try:
+        async with COVER_SLOTS:
+            if size and not enough_disk(size):
+                return await status.edit_text("❌ Server disk is full right now. Please try again in a few minutes.")
+            ACTIVE[key] = job
+            path, state = f"{d}/{name}", {"done": 0, "total": size}
+            fut = asyncio.create_task(asyncio.to_thread(linkdl.download, info, path, limit, state, job.event))
+            t0 = time.time()
+            while True:
+                done, _ = await asyncio.wait({fut}, timeout=3)
+                if done:
+                    break
+                cur, total = state["done"], state["total"] or 0
+                spd = cur / max(time.time() - t0, 0.001)
+                if total:
+                    txt = render("⬇️ Downloading link", cur * 100 / total,
+                                 f"📦 {human(cur)} / {human(total)}\n🚀 {human(spd)}/s\n"
+                                 f"⏳ ETA {fmt_time((total - cur) / spd if spd else 0)}")
+                else:
+                    txt = f"⬇️ Downloading link\n📦 {human(cur)}\n🚀 {human(spd)}/s"
+                try:
+                    await status.edit_text(txt, reply_markup=kb)
+                except Exception:
+                    pass
+            job.returncode = 0
+            await fut                                   # raises LinkError / Cancelled / network error
+            await retry(lambda: send_back(c, m.chat.id, path, uid, status, f"`{name}`"), tries=3)
+            await status.delete()
+    except linkdl.Cancelled:
+        await status.edit_text("🛑 Download cancelled.")
+    except linkdl.LinkError as e:
+        await status.edit_text(f"❌ {e}")
+    except Exception as e:                              # never fail silently
+        try:
+            await status.edit_text(f"❌ Failed: `{redact(e)}`")
+        except Exception:
+            pass
+    finally:
+        ACTIVE.pop(key, None)
+        CANCELLED.discard(key)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+async def handle_link(c, m: Message, urls, limit, uid):
+    if LINK_USERS and c is app and uid not in LINK_USERS:
+        return await m.reply("🔒 Link downloads are not enabled for your account.", quote=True)
+    for url in urls:
+        host = urllib.parse.urlsplit(url).hostname or ""
+        if TERABOX_HOST.search(host):
+            await m.reply("🔗 TeraBox links are share pages, not direct files, so I can't download them.\n\n"
+                          "Download the file yourself and send it here (I add the cover instantly), "
+                          "or send a **direct file link**.", quote=True)
+            continue
+        await download_link(c, m, url, limit, uid)
+
+
 @app.on_message(filters.text & filters.private &
                 ~filters.command(["thumb", "delthumb", "show_cover", "del_cover",
                                   "settings", "rename", "start"]))
@@ -567,7 +700,13 @@ async def text_in(c, m: Message):
     uid = m.from_user.id
     if uid in PENDING_RENAME:
         orig = await c.get_messages(m.chat.id, PENDING_RENAME.pop(uid))
-        await do_rename(c, orig, m.text.strip(), m)
+        return await do_rename(c, orig, m.text.strip(), m)
+    urls = find_urls(m.text)
+    if urls:
+        return await handle_link(c, m, urls, MAX_BYTES, uid)
+    await m.reply("Send me a **video** to add your cover, or a **photo** to set your cover.\n"
+                  "You can also send a **direct file link** (https://…/file.mkv).\n\n"
+                  "/settings • /show_cover • /del_cover", quote=True)
 
 
 @app.on_message(filters.command("start"))
@@ -578,7 +717,8 @@ async def start(_, m):
         "**How it works:** 🤔\n"
         "1. Send your **photo** (cover/thumbnail).\n"
         "2. Send your **video**, and the bot will add the cover automatically.\n\n"
-        "Cover works on videos of ANY size (instant, nothing is uploaded again).\n\n"
+        "Cover works on videos of ANY size (instant, nothing is uploaded again).\n"
+        "You can also send a **direct file link** (https://…/file.mkv) and I will download it for you.\n\n"
         "✱ **Commands:**\n"
         "/settings - Customize bot settings\n"
         "/show_cover - View your current cover\n"
@@ -683,6 +823,14 @@ async def cb(c: Client, q: CallbackQuery):
     media = msg.video or msg.document
     if not media:
         return await q.answer("File not found", show_alert=True)
+    await q.answer()                                   # stop the button's loading spinner
+    size = media.file_size or 0
+    if action in ("mp4", "mkv") and size > MAX_BYTES:  # result ~ same size -> cannot be uploaded by a bot
+        return await q.message.edit_text(
+            f"❌ This file is {size // 1024 // 1024} MB and the result would be about the same size. "
+            f"A bot can upload at most {MAX_BYTES // 1024 // 1024} MB.")
+    if action != "rn" and not enough_disk(size * (2.1 if action in ("mp4", "mkv") else 1.3)):
+        return await q.message.edit_text("❌ Server disk is full right now. Please try again in a few minutes.")
 
     if action == "rn":
         PENDING_RENAME[q.from_user.id] = int(mid)
@@ -694,8 +842,10 @@ async def cb(c: Client, q: CallbackQuery):
     d = f"{WORK}/{mid}_{int(time.time())}"
     os.makedirs(d, exist_ok=True)
     try:
-        src = await msg.download(file_name=f"{d}/src", progress=progress_cb(status, "⬇️ Downloading"))
-        base = os.path.splitext(media.file_name or "video")[0]
+        src = await retry(lambda: msg.download(file_name=f"{d}/src",
+                                                progress=progress_cb(status, "⬇️ Downloading")))
+        base = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", os.path.splitext(media.file_name or "video")[0]
+                      ).strip(" .")[:150] or "video"
         outs = []   # list of dst paths to upload
 
         if action == "qall":
@@ -717,7 +867,7 @@ async def cb(c: Client, q: CallbackQuery):
         else:
             mode = modes[0]
             ext = "mkv" if mode == "mkv" else "mp4"
-            suffix = {"port": "portrait"}.get(mode, mode)
+            suffix = "portrait" if mode == "port" else (f"{mode[1:]}p" if mode.startswith("q") else mode)
             dst = f"{d}/{base}_{suffix}.{ext}"
             dur = (await probe(src))[0]
             await status.edit_text("⏳ Waiting for a free converter slot…")
@@ -732,6 +882,10 @@ async def cb(c: Client, q: CallbackQuery):
             outs = [dst]
 
         os.remove(src)
+        for p in outs:
+            if os.path.getsize(p) > MAX_BYTES:
+                raise ValueError(f"result is {os.path.getsize(p) // 1024 // 1024} MB, over the "
+                                 f"{MAX_BYTES // 1024 // 1024} MB bot upload limit")
         # upload all results in parallel
         sts = [status] + [await status.reply("⬆️ Preparing upload…") for _ in outs[1:]]
         await asyncio.gather(*(send_back(c, q.message.chat.id, p, q.from_user.id, st,
@@ -780,6 +934,11 @@ if user:
             return await m.reply("Reply to a video/file with: `/rename New Name.mkv`")
         await do_rename(c, t, parts[1].strip(), m)
 
+    async def user_link(c, m: Message):
+        await handle_link(c, m, find_urls(m.text), MAX_BYTES_USER, c.me.id)
+
+    # paste a direct link in Saved Messages -> downloaded and sent back with your cover (up to ~4 GB)
+    user.add_handler(MessageHandler(user_link, saved & filters.text & filters.regex(r"^\s*https?://")))
     # forward a video to Saved Messages -> cover added automatically
     user.add_handler(MessageHandler(user_forwarded,
                      saved & filters.forwarded & (filters.video | filters.document)))
