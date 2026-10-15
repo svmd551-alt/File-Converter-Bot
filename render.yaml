@@ -20,3 +20,15 @@ services:
         value: "26"
       - key: PORTRAIT_RES
         value: 720x1280         # use 1080x1920 for full HD (slower)
+      - key: COVER_JOBS
+        value: "2"            # parallel cover jobs (use 1 on small disk)
+      - key: SESSION_STRING     # optional: Premium account session -> files up to ~4 GB
+        sync: false
+      - key: TRANSMISSIONS      # parallel file parts (speed). 8-16 is fine
+        value: "12"
+      - key: FAST_UPLOAD        # 1 = multi-connection upload (default), 0 = stock Pyrogram
+        value: "1"
+      - key: UPLOAD_CONNS       # connections per upload. 8 default; try 12-16 if stable, 4-6 if you see errors
+        value: "8"
+      - key: UPLOAD_WORKERS     # parts in flight per connection
+        value: "2"
