@@ -12,25 +12,57 @@ Install:
   apt install ffmpeg
 Env vars:
   API_ID, API_HASH, BOT_TOKEN
+  SESSION_STRING (optional, Telegram Premium account) -> files up to ~4 GB via Saved Messages
 Run:
   python media_bot.py
 """
-import os, asyncio, time, shutil, json
+import os, re, asyncio, time, shutil, json
 from pyrogram import Client, filters, enums
+from pyrogram.errors import FloodWait
+from pyrogram.handlers import MessageHandler
+
+try:                                   # faster event loop = faster transfers
+    import uvloop
+    uvloop.install()
+except Exception:
+    pass
 from pyrogram.types import (InlineKeyboardMarkup, InlineKeyboardButton,
                             CallbackQuery, Message)
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+SESSION_STRING = os.environ.get("SESSION_STRING", "").strip()   # Premium user account (for 4 GB)
 
-WORK = "work"
-THUMBS = "thumbs"
+WORK = os.path.abspath("work")
+THUMBS = os.path.abspath("thumbs")
+shutil.rmtree(WORK, ignore_errors=True)      # clear leftovers of a crashed/restarted run (frees disk)
 os.makedirs(WORK, exist_ok=True)
 os.makedirs(THUMBS, exist_ok=True)
 
+# Telegram bots: 2 GB per file. A Premium *user* account (SESSION_STRING): ~4 GB (4000 MiB).
+MAX_BYTES = 2000 * 1024 * 1024
+MAX_BYTES_USER = 4000 * 1024 * 1024
+THUMB_MAX_BYTES = 190 * 1024                 # Telegram: thumbnail must be < 200 KB
+THUMB_MAX_SIDE = 320                         # Telegram: thumbnail sides must be <= 320 px
+
+# TRANSMISSIONS = how many files may transfer at the same time (NOT per-file speed;
+# per-file upload speed comes from fast_upload.py: UPLOAD_CONNS / UPLOAD_WORKERS)
+CONC = int(os.environ.get("TRANSMISSIONS", "12"))
 app = Client("media_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
-             workers=32, max_concurrent_transmissions=8)
+             workers=32, max_concurrent_transmissions=CONC, sleep_threshold=60)
+user = (Client("media_user", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING,
+               workers=16, max_concurrent_transmissions=CONC, sleep_threshold=60)
+        if SESSION_STRING else None)
+
+# multi-connection upload (much faster for big files; falls back to stock Pyrogram if anything fails)
+if os.environ.get("FAST_UPLOAD", "1") != "0":
+    try:
+        import fast_upload
+        fast_upload.install(Client)
+        print(f"[fast_upload] on: {fast_upload.CONNS} connections x {fast_upload.PER_CONN} parts", flush=True)
+    except Exception as e:
+        print(f"[fast_upload] not enabled: {e!r}", flush=True)
 
 # ── speed settings (override with env vars on Render) ──
 CPU = os.cpu_count() or 2
@@ -39,6 +71,9 @@ CRF = os.environ.get("X264_CRF", "26")                # higher = faster/smaller,
 PORTRAIT_W, PORTRAIT_H = (int(x) for x in os.environ.get("PORTRAIT_RES", "720x1280").split("x"))
 # 1 heavy ffmpeg job at a time gets ALL cores (faster than 2 jobs fighting for CPU)
 JOB_SLOTS = asyncio.Semaphore(1 if CPU <= 4 else 2)
+# cover jobs (download + upload): limit parallel big files so the disk never fills up
+COVER_SLOTS = asyncio.Semaphore(int(os.environ.get("COVER_JOBS", "2")))
+TASKS = set()
 VENC = ["-c:v", "libx264", "-preset", PRESET, "-crf", CRF, "-threads", "0",
         "-pix_fmt", "yuv420p", "-sn"]
 AENC = ["-c:a", "aac", "-b:a", "96k", "-ac", "2"]
@@ -95,12 +130,22 @@ def render(label, pct, extra=""):
 
 
 def progress_cb(msg, label):
-    """Download / upload progress: bar, size, speed, ETA."""
-    st = {"t": 0, "t0": time.time()}
+    """Download / upload progress. Edits run in the background so they never slow the transfer."""
+    st = {"t": 0, "t0": time.time(), "busy": False, "block": 0}
+
+    async def edit(text):
+        try:
+            await msg.edit_text(text)
+        except FloodWait as e:
+            st["block"] = time.time() + (getattr(e, "value", None) or getattr(e, "x", 5))
+        except Exception:
+            pass
+        finally:
+            st["busy"] = False
 
     async def cb(cur, total):
         now = time.time()
-        if now - st["t"] < 3 and cur < total:
+        if st["busy"] or now < st["block"] or (now - st["t"] < 5 and cur < total):
             return
         st["t"] = now
         total = total or cur or 1
@@ -108,12 +153,76 @@ def progress_cb(msg, label):
         el = max(now - st["t0"], 0.001)
         speed = cur / el
         eta = (total - cur) / speed if speed else 0
-        try:
-            await msg.edit_text(render(label, pct,
-                f"📦 {human(cur)} / {human(total)}\n🚀 {human(speed)}/s\n⏳ ETA {fmt_time(eta)}"))
-        except Exception:
-            pass
+        st["busy"] = True
+        t = asyncio.create_task(edit(render(label, pct,
+            f"📦 {human(cur)} / {human(total)}\n🚀 {human(speed)}/s\n⏳ ETA {fmt_time(eta)}")))
+        TASKS.add(t)
+        t.add_done_callback(TASKS.discard)
     return cb
+
+
+async def retry(fn, tries=4):
+    """Run an async call; retry on network errors, wait out FloodWait."""
+    attempt = floods = 0
+    while True:
+        try:
+            return await fn()
+        except FloodWait as e:
+            floods += 1
+            if floods > 10:
+                raise
+            await asyncio.sleep((getattr(e, "value", None) or getattr(e, "x", 5)) + 1)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            attempt += 1
+            if attempt >= tries:
+                raise
+            await asyncio.sleep(3 * attempt)
+
+
+def safe_name(name, fallback):
+    """Strip path characters and keep the name short enough for any filesystem."""
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name or "").strip(" .") or fallback
+    base, ext = os.path.splitext(name)
+    return base[:120] + ext[:10]
+
+
+def enough_disk(size):
+    try:
+        return shutil.disk_usage(WORK).free > size * 1.05 + 100 * 1024 * 1024
+    except Exception:
+        return True
+
+
+async def make_thumb(src, dst):
+    """Make a Telegram-valid thumbnail: JPEG, max 320x320, under 200 KB. Tries lower quality until it fits."""
+    tmp = dst + ".tmp.jpg"
+    for q in (3, 6, 10, 15, 22, 31):
+        code, _ = await run(["ffmpeg", "-y", "-i", src, "-frames:v", "1",
+                             "-vf", f"scale={THUMB_MAX_SIDE}:{THUMB_MAX_SIDE}:force_original_aspect_ratio=decrease",
+                             "-pix_fmt", "yuvj420p", "-q:v", str(q), tmp])
+        if code == 0 and os.path.exists(tmp) and os.path.getsize(tmp) < THUMB_MAX_BYTES:
+            os.replace(tmp, dst)
+            return True
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    return False
+
+
+async def good_thumb(uid):
+    """Return the user's thumbnail path, repairing old/invalid ones (wrong size/dimensions) first."""
+    p = thumb_path(uid)
+    if not p:
+        return None
+    try:
+        _, w, h = await probe(p)
+        ok = 0 < w <= THUMB_MAX_SIDE and 0 < h <= THUMB_MAX_SIDE and os.path.getsize(p) < THUMB_MAX_BYTES
+    except Exception:
+        ok = False
+    if not ok and not await make_thumb(p, p):
+        return None
+    return p
 
 
 async def run_ffmpeg(cmd, duration, status, label):
@@ -224,14 +333,22 @@ async def settings_cb(_, q: CallbackQuery):
 
 
 # ───────────────────────── cover / thumbnail (MAIN FEATURE) ─────────────────────────
+async def store_thumb(m: Message):
+    """Save a photo (or an image sent as file) as the user's cover."""
+    uid = m.from_user.id
+    raw = await m.download(file_name=f"{THUMBS}/{uid}_raw")
+    try:
+        ok = await make_thumb(raw, f"{THUMBS}/{uid}.jpg")
+    finally:
+        if raw and os.path.exists(raw):
+            os.remove(raw)
+    await m.reply("✅ **Cover saved!**\nNow send your video and I will add it automatically." if ok
+                  else "❌ Could not use this image. Please send a different photo.")
+
+
 @app.on_message(filters.photo & filters.private)
 async def save_thumb(_, m: Message):
-    p = await m.download(file_name=f"{THUMBS}/{m.from_user.id}_raw.jpg")
-    # Telegram thumbnails must be JPEG, <=320px, <200KB
-    await run(["ffmpeg", "-y", "-i", p, "-vf", "scale='min(320,iw)':-2", "-q:v", "4",
-               f"{THUMBS}/{m.from_user.id}.jpg"])
-    os.remove(p)
-    await m.reply("✅ **Cover saved!**\nNow send your video and I will add it automatically.")
+    await store_thumb(m)
 
 
 @app.on_message(filters.command(["show_cover", "thumb"]) & filters.private)
@@ -249,28 +366,51 @@ async def del_thumb(_, m):
     await m.reply("🗑 Cover deleted.")
 
 
-async def apply_cover(c, msg: Message):
-    """Re-upload the user's video/file with their cover. No FFmpeg = no quality loss, very fast."""
-    uid = msg.from_user.id
+async def apply_cover(c, msg: Message, limit=MAX_BYTES, uid=None):
+    """Re-upload the video/file with the user's cover. No FFmpeg re-encode = no quality loss.
+    Works for any size Telegram allows: queue, disk check, retries, FloodWait handling."""
+    uid = uid or msg.from_user.id
     media = msg.video or msg.document
-    name = media.file_name or f"video_{msg.id}.mp4"
-    status = await msg.reply("⬇️ Starting download…", quote=True)
+    size = media.file_size or 0
+    if size > limit:
+        tip = ("\n\n💡 Forward this file to your **Saved Messages** — my Premium helper will add the cover "
+               "(up to ~4 GB)." if (user and c is app) else "")
+        return await msg.reply(f"❌ This file is over {limit // 1024 // 1024} MB, the most Telegram "
+                               f"allows here.{tip}", quote=True)
+    if not await good_thumb(uid):
+        return await msg.reply("🖼 No cover found. Send me a **photo** (to the bot) first, then try again.",
+                               quote=True)
+    name = safe_name(media.file_name, f"video_{msg.id}.mp4")
+    status = await msg.reply("⏳ Queued… starting soon.", quote=True)
     d = f"{WORK}/{msg.id}_{int(time.time())}"
     os.makedirs(d, exist_ok=True)
     try:
-        path = await msg.download(file_name=f"{d}/{name}",
-                                  progress=progress_cb(status, "⬇️ Downloading"))
-        up = progress_cb(status, "⬆️ Uploading")
-        kw = dict(caption=msg.caption or "", caption_entities=msg.caption_entities,
-                  parse_mode=enums.ParseMode.DISABLED, thumb=thumb_path(uid), progress=up)
-        if msg.video:
-            await c.send_video(msg.chat.id, path, duration=media.duration, width=media.width,
-                               height=media.height, supports_streaming=True, **kw)
-        else:
-            await c.send_document(msg.chat.id, path, file_name=name, **kw)
-        await status.delete()
+        async with COVER_SLOTS:
+            if not enough_disk(size):
+                return await status.edit_text("❌ Server disk is full right now. Please try again in a few minutes.")
+            await status.edit_text("⬇️ Starting download…")
+            path = await retry(lambda: msg.download(file_name=f"{d}/{name}",
+                                                    progress=progress_cb(status, "⬇️ Downloading")))
+            if not path:
+                return await status.edit_text("❌ Download failed. Please send the file again.")
+            thumb = await good_thumb(uid)
+            kw = dict(caption=msg.caption or "", caption_entities=msg.caption_entities,
+                      parse_mode=enums.ParseMode.DISABLED, thumb=thumb)
+            if msg.video:
+                await retry(lambda: c.send_video(
+                    msg.chat.id, path, duration=media.duration or 0, width=media.width or 0,
+                    height=media.height or 0, supports_streaming=True,
+                    progress=progress_cb(status, "⬆️ Uploading"), **kw))
+            else:
+                await retry(lambda: c.send_document(
+                    msg.chat.id, path, file_name=name,
+                    progress=progress_cb(status, "⬆️ Uploading"), **kw))
+            await status.delete()
     except Exception as e:
-        await status.edit_text(f"❌ Failed: `{e}`")
+        try:
+            await status.edit_text(f"❌ Failed: `{e}`")
+        except Exception:
+            pass
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -279,6 +419,8 @@ async def apply_cover(c, msg: Message):
 @app.on_message((filters.video | filters.document) & filters.private)
 async def got_file(c, m: Message):
     uid = m.from_user.id
+    if m.document and (m.document.mime_type or "").startswith("image/"):
+        return await store_thumb(m)             # poster sent as a file -> use it as cover
     if get_set(uid)["auto"] and thumb_path(uid):
         return await apply_cover(c, m)          # main flow: instant cover
     hint = "" if thumb_path(uid) else "\n\n💡 Send a **photo** first to set your cover."
@@ -310,6 +452,7 @@ async def start(_, m):
         "**How it works:** 🤔\n"
         "1. Send your **photo** (cover/thumbnail).\n"
         "2. Send your **video**, and the bot will add the cover automatically.\n\n"
+        "Works with big videos (2 GB; up to ~4 GB with the Premium helper).\n\n"
         "✱ **Commands:**\n"
         "/settings - Customize bot settings\n"
         "/show_cover - View your current cover\n"
@@ -325,7 +468,7 @@ async def send_back(c, chat_id, path, uid, status, caption, as_video=True):
     if as_video:
         dur, w, h = await probe(path)
     cb = progress_cb(status, f"⬆️ Uploading `{os.path.basename(path)[:40]}`")
-    t = thumb_path(uid)
+    t = await good_thumb(uid)
     if as_video and path.lower().endswith((".mp4", ".mkv")):
         await c.send_video(chat_id, path, caption=caption, duration=dur, width=w, height=h,
                            thumb=t, supports_streaming=True, progress=cb)
@@ -446,6 +589,28 @@ async def cb(c: Client, q: CallbackQuery):
         shutil.rmtree(d, ignore_errors=True)
 
 
+# ───────────────── Premium helper (files up to ~4 GB via Saved Messages) ─────────────────
+if user:
+    async def _saved(_, c, m):
+        return bool(c.me and m.chat and m.chat.id == c.me.id)
+    saved = filters.create(_saved)
+
+    async def user_forwarded(c, m: Message):
+        await apply_cover(c, m, MAX_BYTES_USER, c.me.id)
+
+    async def user_cover_cmd(c, m: Message):
+        t = m.reply_to_message
+        if not t or not (t.video or t.document):
+            return await m.reply("Reply to a video/file with /cover")
+        await apply_cover(c, t, MAX_BYTES_USER, c.me.id)
+
+    # forward a video to Saved Messages -> cover added automatically
+    user.add_handler(MessageHandler(user_forwarded,
+                     saved & filters.forwarded & (filters.video | filters.document)))
+    # or upload a video to Saved Messages and reply to it with /cover
+    user.add_handler(MessageHandler(user_cover_cmd, saved & filters.command("cover") & filters.reply))
+
+
 async def health_server():
     """Tiny web server so Render web services see an open PORT (and UptimeRobot can ping it)."""
     from aiohttp import web
@@ -468,7 +633,15 @@ async def main():
     await app.start()          # app.run(coroutine) does NOT start the client by itself
     me = await app.get_me()
     print(f"Bot started as @{me.username}", flush=True)
+    if user:
+        await user.start()
+        um = await user.get_me()
+        print(f"Helper account started: {um.first_name} (Premium: {bool(um.is_premium)})", flush=True)
+        if not um.is_premium:
+            print("WARNING: helper account is not Premium -> 4 GB uploads will fail (2 GB max).", flush=True)
     await idle()
+    if user:
+        await user.stop()
     await app.stop()
 
 
