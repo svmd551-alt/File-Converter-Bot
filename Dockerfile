@@ -9,7 +9,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY media_bot.py .
+COPY media_bot.py fast_upload.py ./
 
 ENV PYTHONUNBUFFERED=1
 CMD ["python", "media_bot.py"]
