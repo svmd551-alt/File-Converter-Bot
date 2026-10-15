@@ -18,7 +18,9 @@ Env vars:
 Run:
   python media_bot.py
 """
-import os, re, math, asyncio, time, shutil, json, uuid, threading, urllib.request, urllib.error, urllib.parse
+import os, re, math, asyncio, time, shutil, json, uuid, heapq, itertools, threading
+import urllib.request, urllib.error, urllib.parse
+from html import escape as html_escape
 from pyrogram import Client, filters, enums
 from pyrogram.errors import FloodWait
 from pyrogram.handlers import MessageHandler
@@ -104,6 +106,9 @@ JOB_SLOTS = asyncio.Semaphore(1 if CPU < 6 else 2)
 # cover jobs (download + upload): limit parallel big files so the disk never fills up
 COVER_SLOTS = asyncio.Semaphore(int(os.environ.get("COVER_JOBS", "2")))
 TASKS = set()
+START_TIME = time.time()
+COVER_QUEUES = {}                 # chat_id -> {"heap": [(msg_id, seq, client, msg)], "task": Task}
+SEQ = itertools.count()
 VENC = ["-c:v", "libx264", "-preset", PRESET, "-crf", CRF, "-threads", THREADS,
         "-pix_fmt", "yuv420p", "-sn"]
 AENC = ["-c:a", "aac", "-b:a", "96k", "-ac", "2"]
@@ -313,18 +318,28 @@ async def add_cover_by_file_id(msg, uid):
     cap = msg.caption
     plain = str(cap) if cap else ""
     html = getattr(cap, "html", plain) if cap else ""
+    foot = footer_for(uid, plain)
+    sep = "\n\n" if plain else ""
+    plain_t = plain + (sep + foot if foot else "")
+    html_t = html + (sep + html_escape(foot) if foot else "")
     err = "unknown error"
-    for use_html in ((True, False) if cap else (False,)):
+    for use_html in ((True, False) if plain_t else (False,)):
         fields = {"chat_id": msg.chat.id, "video": msg.video.file_id, "cover": "attach://cover_file"}
-        if cap:
-            fields["caption"] = html if use_html else plain
+        if plain_t:
+            fields["caption"] = html_t if use_html else plain_t
             if use_html:
                 fields["parse_mode"] = "HTML"
-        try:
-            data = await asyncio.to_thread(_bot_api_post, "sendVideo", fields,
-                                           {"cover_file": ("cover.jpg", cover, "image/jpeg")})
-        except Exception as e:                       # network error / timeout: report, never crash silently
-            return False, redact(f"{type(e).__name__}: {e}")
+        for _ in range(6):                                # Telegram flood control (429): wait, then retry
+            try:
+                data = await asyncio.to_thread(_bot_api_post, "sendVideo", fields,
+                                               {"cover_file": ("cover.jpg", cover, "image/jpeg")})
+            except Exception as e:                        # network error / timeout: report, never crash silently
+                return False, redact(f"{type(e).__name__}: {e}")
+            wait = (data.get("parameters") or {}).get("retry_after")
+            if not data.get("ok") and (data.get("error_code") == 429 or wait):
+                await asyncio.sleep(min(int(wait or 5) + 1, 120))
+                continue
+            break
         if data.get("ok"):
             return True, ""
         err = redact(data.get("description", "unknown error"))
@@ -415,7 +430,8 @@ def menu(mid):
 
 # ───────────────────────── settings (per user) ─────────────────────────
 SETTINGS_FILE = f"{THUMBS}/settings.json"
-DEFAULTS = {"auto": True}
+DEFAULTS = {"auto": True, "delete_orig": False, "footer": ""}
+TOGGLES = ("auto", "delete_orig")
 
 
 def load_settings():
@@ -430,26 +446,52 @@ def get_set(uid):
     return {**DEFAULTS, **load_settings().get(str(uid), {})}
 
 
-def toggle_set(uid, key):
+def _save_user(uid, cur):
     data = load_settings()
-    cur = {**DEFAULTS, **data.get(str(uid), {})}
-    cur[key] = not cur[key]
     data[str(uid)] = cur
-    with open(SETTINGS_FILE, "w") as f:
+    tmp = SETTINGS_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(data, f)
+    os.replace(tmp, SETTINGS_FILE)                  # atomic: a crash never leaves a half-written file
+
+
+def toggle_set(uid, key):
+    cur = get_set(uid)
+    if key in TOGGLES:
+        cur[key] = not cur[key]
+        _save_user(uid, cur)
     return cur
+
+
+def set_value(uid, key, value):
+    cur = get_set(uid)
+    cur[key] = value
+    _save_user(uid, cur)
+    return cur
+
+
+def footer_for(uid, base_plain):
+    """User's footer text, or '' if none / if it would push the caption over Telegram's 1024 limit."""
+    f = (get_set(uid).get("footer") or "").strip()
+    return f if f and len(base_plain) + 2 + len(f) <= 1024 else ""
 
 
 def settings_kb(uid):
     st = get_set(uid)
-    return InlineKeyboardMarkup([[InlineKeyboardButton(
-        f"⚡ Auto cover on video: {'ON ✅' if st['auto'] else 'OFF ❌'}", callback_data="set|auto")]])
+    onoff = lambda v: "ON ✅" if v else "OFF ❌"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"⚡ Auto cover on video: {onoff(st['auto'])}", callback_data="set|auto")],
+        [InlineKeyboardButton(f"🗑 Delete my original video: {onoff(st['delete_orig'])}",
+                              callback_data="set|delete_orig")]])
 
 
 SETTINGS_TEXT = ("⚙️ **Settings**\n\n"
                  "**Auto cover ON** – send a video and the cover is added instantly.\n"
                  "**Auto cover OFF** – send a video and you get the tools menu "
-                 "(rename, convert, qualities, portrait).")
+                 "(rename, convert, qualities, portrait).\n"
+                 "**Delete my original** – after the cover is added, your own video message is removed "
+                 "so the chat stays clean.\n\n"
+                 "📝 `/footer your text` adds a line under every captioned video (`/footer off` removes it).")
 
 
 @app.on_message(filters.command("settings") & filters.private)
@@ -503,6 +545,15 @@ async def del_thumb(_, m):
     await m.reply("🗑 Cover deleted.")
 
 
+async def after_success(c, msg, uid):
+    """Optional: remove the user's original message so the chat only keeps the covered video."""
+    if c is app and get_set(uid).get("delete_orig"):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+
 async def apply_cover(c, msg: Message, limit=MAX_BYTES, uid=None):
     """Re-upload the video/file with the user's cover. No FFmpeg re-encode = no quality loss.
     Works for any size Telegram allows: queue, disk check, retries, FloodWait handling."""
@@ -517,6 +568,7 @@ async def apply_cover(c, msg: Message, limit=MAX_BYTES, uid=None):
         st = await msg.reply("⚡ Adding cover (no upload needed)…", quote=True)
         ok, err = await add_cover_by_file_id(msg, uid)
         if ok:
+            await after_success(c, msg, uid)
             return await st.delete()
         print(f"[cover] file_id method failed: {err}", flush=True)
         if size > limit:                                  # cannot fall back to re-upload for huge files
@@ -548,7 +600,10 @@ async def apply_cover(c, msg: Message, limit=MAX_BYTES, uid=None):
             if not path:
                 return await status.edit_text("❌ Download failed. Please send the file again.")
             thumb = await good_thumb(uid)
-            kw = dict(caption=msg.caption or "", caption_entities=msg.caption_entities,
+            base_cap = str(msg.caption) if msg.caption else ""
+            foot = footer_for(uid, base_cap)               # appended at the end -> entity offsets stay valid
+            kw = dict(caption=base_cap + ((("\n\n" if base_cap else "") + foot) if foot else ""),
+                      caption_entities=msg.caption_entities,
                       parse_mode=enums.ParseMode.DISABLED, thumb=thumb)
             if msg.video:
                 await retry(lambda: c.send_video(
@@ -560,6 +615,7 @@ async def apply_cover(c, msg: Message, limit=MAX_BYTES, uid=None):
                     msg.chat.id, path, file_name=name,
                     progress=progress_cb(status, "⬆️ Uploading"), **kw))
             await status.delete()
+            await after_success(c, msg, uid)
     except Exception as e:
         try:
             await status.edit_text(f"❌ Failed: `{e}`")
@@ -569,6 +625,40 @@ async def apply_cover(c, msg: Message, limit=MAX_BYTES, uid=None):
         shutil.rmtree(d, ignore_errors=True)
 
 
+# ───────────────────────── batch queue (forward a whole series) ─────────────────────────
+async def _cover_worker(chat_id):
+    """Process one chat's videos one by one, in message order, ~1/second (Telegram flood limit)."""
+    q = COVER_QUEUES[chat_id]
+    await asyncio.sleep(1.0)                      # let a burst of forwarded videos arrive first
+    if len(q["heap"]) > 1:
+        try:
+            await q["heap"][0][3].reply(f"📥 {len(q['heap'])} videos queued — I will add the cover to each, in order.")
+        except Exception:
+            pass
+    while q["heap"]:
+        _, _, c, msg = heapq.heappop(q["heap"])
+        try:
+            await apply_cover(c, msg)
+        except Exception as e:                    # one bad video must not stop the rest
+            print(f"[queue] {e!r}", flush=True)
+            try:
+                await msg.reply(f"❌ Failed: `{redact(e)}`", quote=True)
+            except Exception:
+                pass
+        if q["heap"]:
+            await asyncio.sleep(1.1)
+    COVER_QUEUES.pop(chat_id, None)               # no await between the check above and here
+
+
+async def enqueue_cover(c, msg: Message):
+    q = COVER_QUEUES.setdefault(msg.chat.id, {"heap": [], "task": None})
+    heapq.heappush(q["heap"], (msg.id, next(SEQ), c, msg))
+    if not q["task"] or q["task"].done():
+        q["task"] = asyncio.create_task(_cover_worker(msg.chat.id))
+        TASKS.add(q["task"])
+        q["task"].add_done_callback(TASKS.discard)
+
+
 # ───────────────────────── file received ─────────────────────────
 @app.on_message((filters.video | filters.document) & filters.private)
 async def got_file(c, m: Message):
@@ -576,7 +666,7 @@ async def got_file(c, m: Message):
     if m.document and (m.document.mime_type or "").startswith("image/"):
         return await store_thumb(m)             # poster sent as a file -> use it as cover
     if get_set(uid)["auto"] and thumb_path(uid):
-        return await apply_cover(c, m)          # main flow: instant cover
+        return await enqueue_cover(c, m)        # main flow: instant cover (ordered queue)
     hint = "" if thumb_path(uid) else "\n\n💡 Send a **photo** first to set your cover."
     await m.reply("What do you want to do?" + hint, reply_markup=menu(m.id), quote=True)
 
@@ -589,6 +679,43 @@ async def quick_rename(c, m: Message):
 
 
 # ───────────────────────── direct links ─────────────────────────
+@app.on_message(filters.command("footer") & filters.private)
+async def footer_cmd(_, m: Message):
+    uid = m.from_user.id
+    parts = (m.text or "").split(None, 1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    if not arg:
+        cur = get_set(uid).get("footer")
+        return await m.reply((f"📝 Your footer:\n\n{cur}\n\n" if cur else "📝 No footer set.\n\n") +
+                             "Set it with `/footer your text` — it is added under the caption of every video "
+                             "that gets a cover. Remove it with `/footer off`.")
+    if arg.lower() in ("off", "none", "clear", "delete"):
+        set_value(uid, "footer", "")
+        return await m.reply("🗑 Footer removed.")
+    if len(arg) > 200:
+        return await m.reply("❌ Footer is too long (max 200 characters).")
+    set_value(uid, "footer", arg)
+    await m.reply("✅ Footer saved. It will be added under the caption of your videos.")
+
+
+@app.on_message(filters.command("status") & filters.private)
+async def status_cmd(_, m: Message):
+    try:
+        du = shutil.disk_usage(WORK)
+        disk = f"{human(du.free)} free of {human(du.total)}"
+    except Exception:
+        disk = "unknown"
+    queued = sum(len(q["heap"]) for q in COVER_QUEUES.values())
+    await m.reply("📊 **Status**\n"
+                  f"⏱ Uptime: {fmt_time(time.time() - START_TIME)}\n"
+                  f"🖥 CPU cores: {CPU:.2f}\n"
+                  f"💾 Disk: {disk}\n"
+                  f"⚙️ Jobs running: {len(ACTIVE)}\n"
+                  f"📥 Videos waiting in queue: {queued}\n"
+                  f"🚀 Fast upload: {'on' if os.environ.get('FAST_UPLOAD', '1') != '0' else 'off'}\n"
+                  f"⭐ Premium helper: {'on' if user else 'off'}", quote=True)
+
+
 URL_FIND = re.compile(r"https?://[^\s<>\"']+", re.I)
 TERABOX_HOST = re.compile(r"(tera|nephobox|4funbox|mirrobox|momerybox)", re.I)
 
@@ -695,7 +822,7 @@ async def handle_link(c, m: Message, urls, limit, uid):
 
 @app.on_message(filters.text & filters.private &
                 ~filters.command(["thumb", "delthumb", "show_cover", "del_cover",
-                                  "settings", "rename", "start"]))
+                                  "settings", "rename", "start", "footer", "status"]))
 async def text_in(c, m: Message):
     uid = m.from_user.id
     if uid in PENDING_RENAME:
@@ -721,6 +848,8 @@ async def start(_, m):
         "You can also send a **direct file link** (https://…/file.mkv) and I will download it for you.\n\n"
         "✱ **Commands:**\n"
         "/settings - Customize bot settings\n"
+        "/footer - Add a footer line under your captions\n"
+        "/status - Server status\n"
         "/show_cover - View your current cover\n"
         "/del_cover - Delete your saved cover\n"
         "\n"
