@@ -16,7 +16,7 @@ Env vars:
 Run:
   python media_bot.py
 """
-import os, re, math, asyncio, time, shutil, json
+import os, re, math, asyncio, time, shutil, json, uuid, urllib.request, urllib.error
 from pyrogram import Client, filters, enums
 from pyrogram.errors import FloodWait
 from pyrogram.handlers import MessageHandler
@@ -32,6 +32,7 @@ from pyrogram.types import (InlineKeyboardMarkup, InlineKeyboardButton,
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+BOT_API_URL = os.environ.get("BOT_API_URL", "https://api.telegram.org").rstrip("/")
 SESSION_STRING = os.environ.get("SESSION_STRING", "").strip()   # Premium user account (for 4 GB)
 
 WORK = os.path.abspath("work")
@@ -111,6 +112,12 @@ QUALITIES = {"360": 360, "480": 480, "720": 720}
 def thumb_path(uid):
     p = f"{THUMBS}/{uid}.jpg"
     return p if os.path.exists(p) else None
+
+
+def cover_path(uid):
+    """HD cover photo (for Telegram's video-cover feature). Falls back to the small thumbnail."""
+    p = f"{THUMBS}/{uid}_cover.jpg"
+    return p if os.path.exists(p) else thumb_path(uid)
 
 
 async def run(cmd):
@@ -233,6 +240,74 @@ async def make_thumb(src, dst):
     if os.path.exists(tmp):
         os.remove(tmp)
     return False
+
+
+async def make_cover(src, dst):
+    """HD JPEG for the video cover: fits inside 1280x1280 (never upscaled), under ~4 MB."""
+    tmp = dst + ".tmp.jpg"
+    for q in (2, 5, 9, 15, 24):
+        code, _ = await run(["ffmpeg", "-y", "-i", src, "-frames:v", "1",
+                             "-vf", "scale=w='min(1280,iw)':h='min(1280,ih)':force_original_aspect_ratio=decrease",
+                             "-pix_fmt", "yuvj420p", "-q:v", str(q), tmp])
+        if code == 0 and os.path.exists(tmp) and os.path.getsize(tmp) < 4 * 1024 * 1024:
+            os.replace(tmp, dst)
+            return True
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    return False
+
+
+def _multipart(fields, files):
+    boundary = "----cover" + uuid.uuid4().hex
+    out = []
+    for k, v in fields.items():
+        out.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n'.encode()
+                   + str(v).encode() + b"\r\n")
+    for k, (fname, data, ctype) in files.items():
+        out.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"; filename="{fname}"\r\n'
+                   f'Content-Type: {ctype}\r\n\r\n'.encode() + data + b"\r\n")
+    out.append(f"--{boundary}--\r\n".encode())
+    return boundary, b"".join(out)
+
+
+def _bot_api_post(method, fields, files, timeout=180):
+    boundary, body = _multipart(fields, files)
+    req = urllib.request.Request(f"{BOT_API_URL}/bot{BOT_TOKEN}/{method}", data=body,
+                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:                  # Bot API sends errors as JSON with HTTP 400
+        try:
+            return json.loads(e.read().decode())
+        except Exception:
+            return {"ok": False, "description": f"HTTP {e.code}"}
+
+
+async def add_cover_by_file_id(msg, uid):
+    """Telegram 'video cover': resend the SAME video (by file_id) with a new cover.
+    Nothing is downloaded or uploaded, so it is instant and works for ANY video size."""
+    cp = cover_path(uid)
+    with open(cp, "rb") as fh:
+        cover = fh.read()
+    cap = msg.caption
+    plain = str(cap) if cap else ""
+    html = getattr(cap, "html", plain) if cap else ""
+    err = "unknown error"
+    for use_html in ((True, False) if cap else (False,)):
+        fields = {"chat_id": msg.chat.id, "video": msg.video.file_id, "cover": "attach://cover_file"}
+        if cap:
+            fields["caption"] = html if use_html else plain
+            if use_html:
+                fields["parse_mode"] = "HTML"
+        data = await asyncio.to_thread(_bot_api_post, "sendVideo", fields,
+                                       {"cover_file": ("cover.jpg", cover, "image/jpeg")})
+        if data.get("ok"):
+            return True, ""
+        err = data.get("description", "unknown error")
+        if "parse entities" not in err.lower():
+            break
+    return False, err
 
 
 async def good_thumb(uid):
@@ -371,6 +446,8 @@ async def store_thumb(m: Message):
     raw = await m.download(file_name=f"{THUMBS}/{uid}_raw")
     try:
         ok = await make_thumb(raw, f"{THUMBS}/{uid}.jpg")
+        if ok:
+            await make_cover(raw, f"{THUMBS}/{uid}_cover.jpg")      # HD copy for the instant-cover method
     finally:
         if raw and os.path.exists(raw):
             os.remove(raw)
@@ -392,9 +469,9 @@ async def show_thumb(_, m):
 
 @app.on_message(filters.command(["del_cover", "delthumb"]) & filters.private)
 async def del_thumb(_, m):
-    t = thumb_path(m.from_user.id)
-    if t:
-        os.remove(t)
+    for p in (thumb_path(m.from_user.id), f"{THUMBS}/{m.from_user.id}_cover.jpg"):
+        if p and os.path.exists(p):
+            os.remove(p)
     await m.reply("🗑 Cover deleted.")
 
 
@@ -404,14 +481,31 @@ async def apply_cover(c, msg: Message, limit=MAX_BYTES, uid=None):
     uid = uid or msg.from_user.id
     media = msg.video or msg.document
     size = media.file_size or 0
-    if size > limit:
-        tip = ("\n\n💡 Forward this file to your **Saved Messages** — my Premium helper will add the cover "
-               "(up to ~4 GB)." if (user and c is app) else "")
-        return await msg.reply(f"❌ This file is over {limit // 1024 // 1024} MB, the most Telegram "
-                               f"allows here.{tip}", quote=True)
     if not await good_thumb(uid):
         return await msg.reply("🖼 No cover found. Send me a **photo** (to the bot) first, then try again.",
                                quote=True)
+    # FAST PATH (any size, no download/upload): resend the same video by file_id with the new cover
+    if c is app and msg.video:
+        st = await msg.reply("⚡ Adding cover (no upload needed)…", quote=True)
+        ok, err = await add_cover_by_file_id(msg, uid)
+        if ok:
+            return await st.delete()
+        print(f"[cover] file_id method failed: {err}", flush=True)
+        if size > limit:                                  # cannot fall back to re-upload for huge files
+            return await st.edit_text(f"❌ Could not add the cover: `{err}`")
+        await st.delete()                                 # small enough -> fall back to re-upload below
+    if size > limit:
+        mb = size // 1024 // 1024
+        if c is app and user:
+            tip = ("\n\n💡 Forward this file to your **Saved Messages** — my Premium helper will add "
+                   "the cover (up to ~4 GB).")
+        elif c is app:
+            tip = ("\n\n💡 To upload files up to ~4 GB, add the Premium helper: set `SESSION_STRING` "
+                   "(see README, needs a Telegram Premium account).")
+        else:
+            tip = ""
+        who = "A bot can upload at most 2000 MB" if c is app else "Telegram's limit is about 4000 MB"
+        return await msg.reply(f"❌ This file is {mb} MB. {who}.{tip}", quote=True)
     name = safe_name(media.file_name, f"video_{msg.id}.mp4")
     status = await msg.reply("⏳ Queued… starting soon.", quote=True)
     d = f"{WORK}/{msg.id}_{int(time.time())}"
@@ -484,7 +578,7 @@ async def start(_, m):
         "**How it works:** 🤔\n"
         "1. Send your **photo** (cover/thumbnail).\n"
         "2. Send your **video**, and the bot will add the cover automatically.\n\n"
-        "Works with big videos (2 GB; up to ~4 GB with the Premium helper).\n\n"
+        "Cover works on videos of ANY size (instant, nothing is uploaded again).\n\n"
         "✱ **Commands:**\n"
         "/settings - Customize bot settings\n"
         "/show_cover - View your current cover\n"
