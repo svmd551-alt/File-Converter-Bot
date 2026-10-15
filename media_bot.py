@@ -16,7 +16,7 @@ Env vars:
 Run:
   python media_bot.py
 """
-import os, re, asyncio, time, shutil, json
+import os, re, math, asyncio, time, shutil, json
 from pyrogram import Client, filters, enums
 from pyrogram.errors import FloodWait
 from pyrogram.handlers import MessageHandler
@@ -65,18 +65,43 @@ if os.environ.get("FAST_UPLOAD", "1") != "0":
         print(f"[fast_upload] not enabled: {e!r}", flush=True)
 
 # ── speed settings (override with env vars on Render) ──
-CPU = os.cpu_count() or 2
+def effective_cpus():
+    """CPU cores this container may really use (cgroup quota aware).
+    os.cpu_count() returns the HOST's cores inside Docker, which is wrong on small plans."""
+    try:
+        n = float(len(os.sched_getaffinity(0)))
+    except Exception:
+        n = float(os.cpu_count() or 2)
+    try:                                              # cgroup v2
+        quota, period = open("/sys/fs/cgroup/cpu.max").read().split()
+        if quota != "max":
+            n = min(n, int(quota) / int(period))
+    except Exception:
+        try:                                          # cgroup v1
+            quota = int(open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read())
+            period = int(open("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read())
+            if quota > 0:
+                n = min(n, quota / period)
+        except Exception:
+            pass
+    return max(n, 0.1)
+
+
+CPU = effective_cpus()
+THREADS = os.environ.get("FFMPEG_THREADS") or str(max(1, math.ceil(CPU)))
+print(f"[cpu] usable CPU cores: {CPU:.2f} -> ffmpeg threads: {THREADS}", flush=True)
 PRESET = os.environ.get("X264_PRESET", "ultrafast")   # ultrafast = fastest, bigger file
 CRF = os.environ.get("X264_CRF", "26")                # higher = faster/smaller, lower quality
 PORTRAIT_W, PORTRAIT_H = (int(x) for x in os.environ.get("PORTRAIT_RES", "720x1280").split("x"))
 # 1 heavy ffmpeg job at a time gets ALL cores (faster than 2 jobs fighting for CPU)
-JOB_SLOTS = asyncio.Semaphore(1 if CPU <= 4 else 2)
+JOB_SLOTS = asyncio.Semaphore(1 if CPU < 6 else 2)
 # cover jobs (download + upload): limit parallel big files so the disk never fills up
 COVER_SLOTS = asyncio.Semaphore(int(os.environ.get("COVER_JOBS", "2")))
 TASKS = set()
-VENC = ["-c:v", "libx264", "-preset", PRESET, "-crf", CRF, "-threads", "0",
+VENC = ["-c:v", "libx264", "-preset", PRESET, "-crf", CRF, "-threads", THREADS,
         "-pix_fmt", "yuv420p", "-sn"]
 AENC = ["-c:a", "aac", "-b:a", "96k", "-ac", "2"]
+ACTIVE, CANCELLED = {}, set()   # running ffmpeg processes / cancelled jobs (by status message id)
 PENDING_RENAME = {}   # user_id -> message_id of file awaiting new name
 
 QUALITIES = {"360": 360, "480": 480, "720": 720}
@@ -225,12 +250,16 @@ async def good_thumb(uid):
     return p
 
 
-async def run_ffmpeg(cmd, duration, status, label):
+async def run_ffmpeg(cmd, duration, status, label, key=None):
     """Run ffmpeg and live-update the status message (bar, speed, ETA)."""
     cmd = cmd[:1] + ["-nostdin", "-progress", "pipe:1", "-nostats"] + cmd[1:]
     p = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     err_buf = bytearray()
+    if key:
+        ACTIVE[key] = p
+    kb = (InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel", callback_data=f"cx|{key}")]])
+          if key else None)
 
     async def read_err():
         while True:
@@ -259,14 +288,17 @@ async def run_ffmpeg(cmd, duration, status, label):
                 el = max(now - t0, 0.001)
                 spd = done / el
                 eta = (duration - done) / spd if spd else 0
+                slow = ("\n\n⚠️ Server is slow for this job. Cancel and convert ONE quality, "
+                        "or use a stronger CPU plan.") if (el > 90 and spd < 0.5 and eta > 7200) else ""
                 try:
                     await status.edit_text(render(label, pct,
                         f"🎞 {fmt_time(done)} / {fmt_time(duration)}\n"
-                        f"🚀 {spd:.1f}x speed\n⏳ ETA {fmt_time(eta)}"))
+                        f"🚀 {spd:.1f}x speed\n⏳ ETA {fmt_time(eta)}") + slow, reply_markup=kb)
                 except Exception:
                     pass
     await p.wait()
     await err_task
+    ACTIVE.pop(key, None)
     return p.returncode, err_buf.decode(errors="ignore")
 
 
@@ -560,7 +592,11 @@ async def cb(c: Client, q: CallbackQuery):
             await status.edit_text(f"⏳ Waiting for a free converter slot…")
             async with JOB_SLOTS:
                 code, err = await run_ffmpeg(ffmpeg_multi(src, paths), dur, status,
-                                             f"⚙️ Converting {', '.join(str(h) + 'p' for h in targets)}")
+                                             f"⚙️ Converting {', '.join(str(h) + 'p' for h in targets)}",
+                                             key=status.id)
+            if status.id in CANCELLED:
+                CANCELLED.discard(status.id)
+                return await status.edit_text("🛑 Conversion cancelled.")
             if code != 0:
                 return await status.edit_text(f"❌ FFmpeg failed:\n`{err[-500:]}`")
             outs = [p for _, p in paths]
@@ -573,7 +609,10 @@ async def cb(c: Client, q: CallbackQuery):
             await status.edit_text("⏳ Waiting for a free converter slot…")
             async with JOB_SLOTS:
                 code, err = await run_ffmpeg(ffmpeg_cmd(src, dst, mode), dur, status,
-                                             f"⚙️ Converting ({mode})")
+                                             f"⚙️ Converting ({mode})", key=status.id)
+            if status.id in CANCELLED:
+                CANCELLED.discard(status.id)
+                return await status.edit_text("🛑 Conversion cancelled.")
             if code != 0 or not os.path.exists(dst):
                 return await status.edit_text(f"❌ FFmpeg failed:\n`{err[-500:]}`")
             outs = [dst]
@@ -587,6 +626,17 @@ async def cb(c: Client, q: CallbackQuery):
             await st.delete()
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+@app.on_callback_query(filters.regex(r"^cx\|"))
+async def cancel_job(c: Client, q: CallbackQuery):
+    key = int(q.data.split("|")[1])
+    p = ACTIVE.get(key)
+    if not p or p.returncode is not None:
+        return await q.answer("Nothing to cancel.", show_alert=True)
+    CANCELLED.add(key)
+    p.kill()
+    await q.answer("Cancelling…")
 
 
 # ───────────────── Premium helper (files up to ~4 GB via Saved Messages) ─────────────────
