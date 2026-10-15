@@ -34,3 +34,7 @@ services:
         value: "2"
       - key: FFMPEG_THREADS     # optional: override auto-detected ffmpeg threads
         sync: false
+      - key: LINK_CONNS         # parallel connections for direct-link downloads
+        value: "6"
+      - key: LINK_ALLOWED_USERS # optional: comma separated Telegram user ids allowed to use links (empty = everyone)
+        sync: false
