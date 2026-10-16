@@ -3,7 +3,7 @@ Telegram Media Bot (Pyrogram + FFmpeg)
 --------------------------------------
 Features
   Send a photo           -> saved as your cover/thumbnail
-  Send a video           -> cover added instantly (Auto cover ON, any size)
+  Send a video           -> permanent cover (thumbnail saved in the file; Auto cover ON)
                             or tools menu (Auto cover OFF): Rename | MKV<->MP4 | 360/480/720p | Portrait 9:16
   /settings              -> Auto cover ON/OFF
   /show_cover /del_cover -> view / delete saved cover
@@ -430,8 +430,8 @@ def menu(mid):
 
 # ───────────────────────── settings (per user) ─────────────────────────
 SETTINGS_FILE = f"{THUMBS}/settings.json"
-DEFAULTS = {"auto": True, "delete_orig": False, "footer": ""}
-TOGGLES = ("auto", "delete_orig")
+DEFAULTS = {"auto": True, "delete_orig": False, "instant": False, "footer": ""}
+TOGGLES = ("auto", "delete_orig", "instant")
 
 
 def load_settings():
@@ -481,6 +481,8 @@ def settings_kb(uid):
     onoff = lambda v: "ON ✅" if v else "OFF ❌"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"⚡ Auto cover on video: {onoff(st['auto'])}", callback_data="set|auto")],
+        [InlineKeyboardButton("🖼 Cover type: " + ("Instant ⚡ (temporary)" if st["instant"] else "Permanent 💾"),
+                              callback_data="set|instant")],
         [InlineKeyboardButton(f"🗑 Delete my original video: {onoff(st['delete_orig'])}",
                               callback_data="set|delete_orig")]])
 
@@ -489,6 +491,11 @@ SETTINGS_TEXT = ("⚙️ **Settings**\n\n"
                  "**Auto cover ON** – send a video and the cover is added instantly.\n"
                  "**Auto cover OFF** – send a video and you get the tools menu "
                  "(rename, convert, qualities, portrait).\n"
+                 "**Cover type – Permanent 💾 (recommended):** the cover is saved INSIDE the video file, so it "
+                 "also shows when other bots (auto-filter bots, channels, forwards) send this file. The bot "
+                 "downloads and uploads the video again (up to 2 GB; up to ~4 GB with the Premium helper).\n"
+                 "**Cover type – Instant ⚡:** works on any size in about a second, but it is a TEMPORARY "
+                 "cover that belongs to this message only. Other bots that re-send the file will NOT show it.\n"
                  "**Delete my original** – after the cover is added, your own video message is removed "
                  "so the chat stays clean.\n\n"
                  "📝 `/footer your text` adds a line under every captioned video (`/footer off` removes it).")
@@ -563,11 +570,20 @@ async def apply_cover(c, msg: Message, limit=MAX_BYTES, uid=None):
     if not await good_thumb(uid):
         return await msg.reply("🖼 No cover found. Send me a **photo** (to the bot) first, then try again.",
                                quote=True)
-    # FAST PATH (any size, no download/upload): resend the same video by file_id with the new cover
-    if c is app and msg.video:
+    # TEMPORARY cover (message-level, no download/upload, any size). Used only when the user chose "Instant"
+    # or when the file is too big for the bot to re-upload. A permanent cover = re-upload with thumbnail.
+    instant = bool(get_set(uid).get("instant"))
+    if c is app and msg.video and (instant or size > limit):
         st = await msg.reply("⚡ Adding cover (no upload needed)…", quote=True)
         ok, err = await add_cover_by_file_id(msg, uid)
         if ok:
+            if not instant:                               # forced by size -> be honest about it
+                tip = ("forward the file to your **Saved Messages** — the Premium helper makes a permanent cover "
+                       "(up to ~4 GB)" if user else
+                       "add the Premium helper (`SESSION_STRING`, see README) for a permanent cover up to ~4 GB")
+                await msg.reply("⚠️ This video is over 2 GB, so a bot cannot re-upload it. I added a **TEMPORARY** "
+                                "cover: it shows in Telegram, but NOT in other bots (e.g. an auto-filter bot).\n\n"
+                                f"💡 For a permanent cover: {tip}.", quote=True)
             await after_success(c, msg, uid)
             return await st.delete()
         print(f"[cover] file_id method failed: {err}", flush=True)
@@ -844,7 +860,8 @@ async def start(_, m):
         "**How it works:** 🤔\n"
         "1. Send your **photo** (cover/thumbnail).\n"
         "2. Send your **video**, and the bot will add the cover automatically.\n\n"
-        "Cover works on videos of ANY size (instant, nothing is uploaded again).\n"
+        "I add your poster as a **permanent cover** inside the video, so it also shows in other bots.\n"
+        "(/settings -> Cover type: Instant works on any size but is temporary.)\n"
         "You can also send a **direct file link** (https://…/file.mkv) and I will download it for you.\n\n"
         "✱ **Commands:**\n"
         "/settings - Customize bot settings\n"
