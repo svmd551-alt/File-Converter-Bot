@@ -155,6 +155,81 @@ async def probe(path):
     return dur, v.get("width", 0), v.get("height", 0)
 
 
+async def probe_streams(path):
+    p = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-print_format", "json", "-show_streams", path,
+        stdout=asyncio.subprocess.PIPE)
+    out, _ = await p.communicate()
+    try:
+        return json.loads(out or "{}").get("streams", [])
+    except ValueError:
+        return []
+
+
+async def duration_of(path):
+    p = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path,
+        stdout=asyncio.subprocess.PIPE)
+    out, _ = await p.communicate()
+    try:
+        return float(out.decode().strip().split()[0])
+    except (ValueError, IndexError):
+        return 0.0
+
+
+async def bad_result(paths, src_dur):
+    """ffmpeg can exit 'successfully' on a damaged/incomplete source and write an empty or short file.
+    Returns a message if any result is unusable, else None."""
+    for p in paths:
+        if not any(x.get("codec_type") == "video" for x in await probe_streams(p)):
+            return "The result has no video. The source file looks damaged or incomplete."
+        out = await duration_of(p)
+        if src_dur and out < src_dur - max(3.0, src_dur * 0.02):
+            return (f"The result is shorter than the original ({int(out)}s instead of {int(src_dur)}s). "
+                    "The source file looks damaged or incomplete.")
+    return None
+
+
+VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".mov", ".webm", ".m4v", ".ts", ".flv", ".wmv", ".mpg", ".mpeg", ".3gp")
+VIDEO_COPY = {"h264", "hevc"}          # can go into MP4 unchanged and Telegram can play them
+AUDIO_COPY = {"aac", "mp3"}            # everything else (ac3, eac3, dts, opus, flac...) -> AAC
+
+
+def is_video_doc(doc):
+    """A file (document) that is really a video."""
+    return bool(doc) and ((doc.mime_type or "").startswith("video/") or
+                          (doc.file_name or "").lower().endswith(VIDEO_EXTS))
+
+
+def plan_video(streams):
+    """Decide how to turn any video file into a Telegram-playable MP4 with the LEAST work.
+    Returns (ffmpeg_args, notes). Video/audio are copied when Telegram can play them as they are."""
+    v = next((x for x in streams if x.get("codec_type") == "video"
+              and not (x.get("disposition") or {}).get("attached_pic")), None)
+    if not v:
+        raise ValueError("this file has no video stream")
+    audios = [x for x in streams if x.get("codec_type") == "audio"]
+    notes, args = [], ["-map", f"0:{v['index']}", "-map", "0:a?"]
+    vc = v.get("codec_name")
+    if vc in VIDEO_COPY:
+        args += ["-c:v", "copy"]
+        if vc == "hevc":
+            args += ["-tag:v", "hvc1"]                       # needed for Apple / Telegram iOS
+            if "10" in (v.get("pix_fmt") or ""):
+                notes.append("10-bit HEVC: a few Telegram apps may not play it")
+    else:
+        args += VENC
+        notes.append(f"{vc} video is re-encoded to H.264 (slower)")
+    for i, a in enumerate(audios):
+        args += [f"-c:a:{i}", "copy" if a.get("codec_name") in AUDIO_COPY else "aac"]
+    if any(a.get("codec_name") not in AUDIO_COPY for a in audios):
+        args += ["-b:a", "160k"]
+        notes.append("audio converted to AAC")
+    if any(x.get("codec_type") == "subtitle" for x in streams):
+        notes.append("subtitles removed (MP4 cannot keep them)")
+    return args + ["-sn", "-dn", "-movflags", "+faststart"], notes
+
+
 def human(n):
     for u in ("B", "KB", "MB", "GB"):
         if n < 1024 or u == "GB":
@@ -418,6 +493,8 @@ async def run_ffmpeg(cmd, duration, status, label, key=None):
 def menu(mid):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ Rename", callback_data=f"rn|{mid}")],
+        [InlineKeyboardButton("📹 File → Video", callback_data=f"tov|{mid}"),
+         InlineKeyboardButton("📁 Video → File", callback_data=f"tof|{mid}")],
         [InlineKeyboardButton("🔁 To MP4", callback_data=f"mp4|{mid}"),
          InlineKeyboardButton("🔁 To MKV", callback_data=f"mkv|{mid}")],
         [InlineKeyboardButton("360p", callback_data=f"q360|{mid}"),
@@ -430,8 +507,8 @@ def menu(mid):
 
 # ───────────────────────── settings (per user) ─────────────────────────
 SETTINGS_FILE = f"{THUMBS}/settings.json"
-DEFAULTS = {"auto": True, "delete_orig": False, "instant": False, "footer": ""}
-TOGGLES = ("auto", "delete_orig", "instant")
+DEFAULTS = {"auto": True, "delete_orig": False, "instant": False, "as_video": False, "footer": ""}
+TOGGLES = ("auto", "delete_orig", "instant", "as_video")
 
 
 def load_settings():
@@ -483,6 +560,8 @@ def settings_kb(uid):
         [InlineKeyboardButton(f"⚡ Auto cover on video: {onoff(st['auto'])}", callback_data="set|auto")],
         [InlineKeyboardButton("🖼 Cover type: " + ("Instant ⚡ (temporary)" if st["instant"] else "Permanent 💾"),
                               callback_data="set|instant")],
+        [InlineKeyboardButton(f"📹 Video files → real Video: {onoff(st['as_video'])}",
+                              callback_data="set|as_video")],
         [InlineKeyboardButton(f"🗑 Delete my original video: {onoff(st['delete_orig'])}",
                               callback_data="set|delete_orig")]])
 
@@ -496,6 +575,8 @@ SETTINGS_TEXT = ("⚙️ **Settings**\n\n"
                  "downloads and uploads the video again (up to 2 GB; up to ~4 GB with the Premium helper).\n"
                  "**Cover type – Instant ⚡:** works on any size in about a second, but it is a TEMPORARY "
                  "cover that belongs to this message only. Other bots that re-send the file will NOT show it.\n"
+                 "**Video files → real Video:** a video that arrives as a *file* (document) is turned into a real, "
+                 "streamable Telegram video (MP4) with your cover. Video/audio are copied when possible, so it is fast.\n"
                  "**Delete my original** – after the cover is added, your own video message is removed "
                  "so the chat stays clean.\n\n"
                  "📝 `/footer your text` adds a line under every captioned video (`/footer off` removes it).")
@@ -567,6 +648,8 @@ async def apply_cover(c, msg: Message, limit=MAX_BYTES, uid=None):
     uid = uid or msg.from_user.id
     media = msg.video or msg.document
     size = media.file_size or 0
+    if get_set(uid).get("as_video") and msg.document and is_video_doc(msg.document):
+        return await to_video(c, msg, msg, limit, uid)     # video sent as a file -> make it a real video
     if not await good_thumb(uid):
         return await msg.reply("🖼 No cover found. Send me a **photo** (to the bot) first, then try again.",
                                quote=True)
@@ -692,6 +775,14 @@ async def quick_rename(c, m: Message):
     if len(m.command) < 2:
         return await m.reply("Usage: reply to a file with `/rename New Name.mkv`")
     await do_rename(c, m.reply_to_message, m.text.split(None, 1)[1], m)
+
+
+@app.on_message(filters.command(["video", "file"]) & filters.reply & filters.private)
+async def quick_convert(c, m: Message):
+    t = m.reply_to_message
+    if not t or not (t.video or t.document):
+        return await m.reply("Reply to a video/file with /video (make it a real video) or /file (send as file).")
+    await (to_video if m.command[0].lower() == "video" else to_file)(c, t, m)
 
 
 # ───────────────────────── direct links ─────────────────────────
@@ -838,7 +929,7 @@ async def handle_link(c, m: Message, urls, limit, uid):
 
 @app.on_message(filters.text & filters.private &
                 ~filters.command(["thumb", "delthumb", "show_cover", "del_cover",
-                                  "settings", "rename", "start", "footer", "status"]))
+                                  "settings", "rename", "start", "footer", "status", "video", "file"]))
 async def text_in(c, m: Message):
     uid = m.from_user.id
     if uid in PENDING_RENAME:
@@ -865,6 +956,8 @@ async def start(_, m):
         "You can also send a **direct file link** (https://…/file.mkv) and I will download it for you.\n\n"
         "✱ **Commands:**\n"
         "/settings - Customize bot settings\n"
+        "/video - Reply to a file: make it a real, streamable video\n"
+        "/file - Reply to a video: send it as a file\n"
         "/footer - Add a footer line under your captions\n"
         "/status - Server status\n"
         "/show_cover - View your current cover\n"
@@ -886,6 +979,110 @@ async def send_back(c, chat_id, path, uid, status, caption, as_video=True):
                            thumb=t, supports_streaming=True, progress=cb)
     else:
         await c.send_document(chat_id, path, caption=caption, thumb=t, progress=cb)
+
+
+async def _check_limits(media, reply_to, limit, c):
+    """Common checks for jobs that download + upload again. Returns True if OK (else the user was told why)."""
+    size = media.file_size or 0
+    if size > limit:
+        if c is app and user:
+            tip = "\n\n💡 Forward the file to your **Saved Messages** and reply to it there (Premium helper, ~4 GB)."
+        elif c is app:
+            tip = "\n\n💡 For files over 2 GB add the Premium helper (`SESSION_STRING`, see README)."
+        else:
+            tip = ""
+        await reply_to.reply(f"❌ This file is {size // 1024 // 1024} MB. The re-upload limit here is "
+                             f"{limit // 1024 // 1024} MB.{tip}")
+        return False
+    if not enough_disk(size * 2.1):
+        await reply_to.reply("❌ Server disk is full right now. Please try again in a few minutes.")
+        return False
+    return True
+
+
+def _stem(name):
+    return re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", os.path.splitext(name or "video")[0]).strip(" .")[:150] or "video"
+
+
+async def to_video(c, orig: Message, reply_to, limit=None, uid=None, status=None):
+    """File (document) -> real Telegram Video: MP4, faststart, streamable, with the user's cover."""
+    limit = limit or (MAX_BYTES if c is app else MAX_BYTES_USER)
+    uid = uid or orig.from_user.id
+    media = orig.document or orig.video
+    if not media:
+        return await reply_to.reply("❌ No file found.")
+    if not await _check_limits(media, reply_to, limit, c):
+        return
+    status = status or await reply_to.reply("⬇️ Starting download…")
+    d = f"{WORK}/tov_{orig.id}_{int(time.time())}"
+    os.makedirs(d, exist_ok=True)
+    try:
+        src = await retry(lambda: orig.download(file_name=f"{d}/src",
+                                                progress=progress_cb(status, "⬇️ Downloading")))
+        args, notes = plan_video(await probe_streams(src))
+        dst = f"{d}/{_stem(media.file_name)}.mp4"
+        dur = await duration_of(src)
+        label = "⚙️ Making video" + (f"\nℹ️ {' • '.join(notes)}" if notes else "")
+        await status.edit_text("⏳ Waiting for a free converter slot…")
+        async with JOB_SLOTS:
+            code, err = await run_ffmpeg(["ffmpeg", "-y", "-i", src, *args, dst], dur, status, label, key=status.id)
+        if status.id in CANCELLED:
+            CANCELLED.discard(status.id)
+            return await status.edit_text("🛑 Cancelled.")
+        if code != 0 or not os.path.exists(dst):
+            return await status.edit_text(f"❌ FFmpeg failed:\n`{err[-500:]}`")
+        bad = await bad_result([dst], dur)
+        if bad:
+            return await status.edit_text(f"❌ {bad}")
+        os.remove(src)
+        if os.path.getsize(dst) > limit:
+            raise ValueError(f"result is {os.path.getsize(dst) // 1024 // 1024} MB, over the "
+                             f"{limit // 1024 // 1024} MB upload limit")
+        base = str(orig.caption) if orig.caption else ""
+        foot = footer_for(uid, base)
+        caption = (base + ((("\n\n" if base else "") + foot) if foot else "")) or f"`{os.path.basename(dst)}`"
+        await retry(lambda: send_back(c, orig.chat.id, dst, uid, status, caption), tries=3)
+        await status.delete()
+        await after_success(c, orig, uid)
+    except Exception as e:                                 # never fail silently
+        try:
+            await status.edit_text(f"❌ Failed: `{redact(e)}`")
+        except Exception:
+            pass
+    finally:
+        CANCELLED.discard(getattr(status, "id", None))
+        shutil.rmtree(d, ignore_errors=True)
+
+
+async def to_file(c, orig: Message, reply_to, limit=None, uid=None, status=None):
+    """Video -> File (document), keeping the cover as the file's thumbnail."""
+    limit = limit or (MAX_BYTES if c is app else MAX_BYTES_USER)
+    uid = uid or orig.from_user.id
+    media = orig.video or orig.document
+    if not media:
+        return await reply_to.reply("❌ No file found.")
+    if not await _check_limits(media, reply_to, limit, c):
+        return
+    status = status or await reply_to.reply("⬇️ Starting download…")
+    name = safe_name(media.file_name, f"video_{orig.id}.mp4")
+    d = f"{WORK}/tof_{orig.id}_{int(time.time())}"
+    os.makedirs(d, exist_ok=True)
+    try:
+        path = await retry(lambda: orig.download(file_name=f"{d}/{name}",
+                                                 progress=progress_cb(status, "⬇️ Downloading")))
+        base = str(orig.caption) if orig.caption else ""
+        foot = footer_for(uid, base)
+        caption = (base + ((("\n\n" if base else "") + foot) if foot else "")) or f"`{name}`"
+        await retry(lambda: send_back(c, orig.chat.id, path, uid, status, caption, as_video=False), tries=3)
+        await status.delete()
+        await after_success(c, orig, uid)
+    except Exception as e:
+        try:
+            await status.edit_text(f"❌ Failed: `{redact(e)}`")
+        except Exception:
+            pass
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 async def do_rename(c, orig: Message, new_name, reply_to):
@@ -962,7 +1159,7 @@ def ffmpeg_multi(src, outputs):
     return cmd
 
 
-@app.on_callback_query(filters.regex(r"^(rn|mp4|mkv|q360|q480|q720|qall|port)\|"))
+@app.on_callback_query(filters.regex(r"^(rn|tov|tof|mp4|mkv|q360|q480|q720|qall|port)\|"))
 async def cb(c: Client, q: CallbackQuery):
     action, mid = q.data.split("|")
     msg = await c.get_messages(q.message.chat.id, int(mid))
@@ -970,6 +1167,9 @@ async def cb(c: Client, q: CallbackQuery):
     if not media:
         return await q.answer("File not found", show_alert=True)
     await q.answer()                                   # stop the button's loading spinner
+    if action in ("tov", "tof"):
+        st = await q.message.edit_text("⏳ Starting…")
+        return await (to_video if action == "tov" else to_file)(c, msg, q.message, MAX_BYTES, q.from_user.id, st)
     size = media.file_size or 0
     if action in ("mp4", "mkv") and size > MAX_BYTES:  # result ~ same size -> cannot be uploaded by a bot
         return await q.message.edit_text(
@@ -1010,6 +1210,9 @@ async def cb(c: Client, q: CallbackQuery):
             if code != 0:
                 return await status.edit_text(f"❌ FFmpeg failed:\n`{err[-500:]}`")
             outs = [p for _, p in paths]
+            bad = await bad_result(outs, dur)
+            if bad:
+                return await status.edit_text(f"❌ {bad}")
         else:
             mode = modes[0]
             ext = "mkv" if mode == "mkv" else "mp4"
@@ -1026,6 +1229,9 @@ async def cb(c: Client, q: CallbackQuery):
             if code != 0 or not os.path.exists(dst):
                 return await status.edit_text(f"❌ FFmpeg failed:\n`{err[-500:]}`")
             outs = [dst]
+            bad = await bad_result(outs, dur)
+            if bad:
+                return await status.edit_text(f"❌ {bad}")
 
         os.remove(src)
         for p in outs:
@@ -1090,6 +1296,13 @@ if user:
                      saved & filters.forwarded & (filters.video | filters.document)))
     # or upload a video to Saved Messages and reply to it with /cover
     user.add_handler(MessageHandler(user_cover_cmd, saved & filters.command("cover") & filters.reply))
+    async def user_convert_cmd(c, m: Message):
+        t = m.reply_to_message
+        if not t or not (t.video or t.document):
+            return await m.reply("Reply to a video/file with /video or /file")
+        await (to_video if m.command[0].lower() == "video" else to_file)(c, t, m, MAX_BYTES_USER, c.me.id)
+
+    user.add_handler(MessageHandler(user_convert_cmd, saved & filters.command(["video", "file"]) & filters.reply))
     # reply to a (big) file in Saved Messages with: /rename New Name.mkv
     user.add_handler(MessageHandler(user_rename_cmd, saved & filters.command("rename") & filters.reply))
 
